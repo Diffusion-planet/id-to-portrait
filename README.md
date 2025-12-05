@@ -4,19 +4,31 @@
 <a href="https://colab.research.google.com/drive/1-Bs5YHwi-dJH0gtU4y0DTY-oLKbhMYkE?usp=sharing"><img src="https://colab.research.google.com/assets/colab-badge.svg" height=22.5></a>
 [![License](https://img.shields.io/github/license/AIRI-Institute/al_toolbox)](./LICENSE)
 
+> This is a development fork of [ControlGenAI/FastFace](https://github.com/ControlGenAI/FastFace) with additional features for the Prometheus project.
+
+**Added Features:**
+- Mac MPS (Apple Silicon) support
+- Web-based UI (React frontend + FastAPI backend)
+- Style image transfer (img2img approach)
+
+---
+
+**Original Description:**
 >In latest years plethora of identity-preserving adapters for a personalized generation with diffusion models have been released. Their main disadvantage is that they are dominantly trained jointly with base diffusion models, which suffer from slow multi-step inference. This work aims to tackle the challenge of training-free adaptation of pretrained ID-adapters to diffusion models accelerated via distillation - through careful re-design of classifier-free guidance for few-step stylistic generation and attention manipulation mechanisms in decoupled blocks to improve identity similarity and fidelity, we propose universal FastFace framework. Additionally, we develop a disentangled public evaluation protocol for id-preserving adapters.
->
 
 ![image](docs/method_scheme_promo.png)
 
 ## Updates
 
-- **2025/6/04** 🔥 colab demo released
-- **2025/5/28**  code and data release
-- **2025/5/27**  arxiv preprint release
+- **2025/12/05** Mac MPS support, Web UI, Style image transfer
+- **2025/6/04** colab demo released
+- **2025/5/28** code and data release
+- **2025/5/27** arxiv preprint release
 
 
 ## Installation
+
+### CUDA (Linux/Windows)
 
 Clone repository, `cd` to directory and run following commands:
 
@@ -27,9 +39,54 @@ pip install -r requirements.txt
 pip install onnxruntime-gpu==1.18.0 --extra-index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/
 ```
 
-**🚩 Important:** depending on underlying versions of `cudnn` and `cuda` backend you might need to tweak installation of `onnxruntime-gpu` for it to work with gpu (everything will work with cpu version, just slower). For further details about recommended version refer to [this issue comment](https://github.com/microsoft/onnxruntime/issues/21684#issuecomment-2375853992) and official documentation.
+**Important:** depending on underlying versions of `cudnn` and `cuda` backend you might need to tweak installation of `onnxruntime-gpu` for it to work with gpu (everything will work with cpu version, just slower). For further details about recommended version refer to [this issue comment](https://github.com/microsoft/onnxruntime/issues/21684#issuecomment-2375853992) and official documentation.
+
+### Mac MPS (Apple Silicon)
+
+```bash
+chmod +x setup_mac.sh
+./setup_mac.sh
+```
+
+Or manually:
+
+```bash
+python -m venv venv_mps
+source venv_mps/bin/activate
+pip install -r requirements_mps.txt
+```
 
 During running all checkpoints and models are installed in local `models_cache/` directory.
+
+## Web UI
+
+A web-based interface for easy image generation.
+
+### Run Backend
+
+```bash
+source venv_mps/bin/activate  # or your venv
+python -m backend.main
+```
+
+Backend runs at `http://localhost:8000`
+
+### Run Frontend
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Frontend runs at `http://localhost:3000`
+
+### Features
+
+- Upload face image for identity preservation
+- Upload style image for background/atmosphere transfer
+- Adjust style strength (higher = more style preservation)
+- Text prompt for additional control
 
 ## Evaluation dataset
 

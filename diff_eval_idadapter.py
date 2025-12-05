@@ -40,7 +40,7 @@ def create_exp_root(out_dir, config_name, exp_name=None):
 @click.option("--lora_scale", nargs=1, type=float, default=None)
 @click.option("--exp_title", nargs=1, type=str, default=None)
 @click.option("--out_dir", nargs=1, type=str, default="res/")
-@click.option("--device", nargs=1, type=str, default="cuda:1")
+@click.option("--device", nargs=1, type=str, default="mps")
 @click.option("--include_hyper_4", is_flag=True, show_default=True, default=False)
 @click.option("--include_lightning_4", is_flag=True, show_default=True, default=False)
 @click.option("--include_lcm_4", is_flag=True, show_default=True, default=False)

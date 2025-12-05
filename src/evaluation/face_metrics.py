@@ -32,8 +32,18 @@ def pt_to_numpy(imgt):
     return img_npy
 
 
+def get_default_device():
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
 class FaceFeatExtract:
-    def __init__(self, pretrained_ckpt='vggface2', im_size=(160, 160), device=torch.device("cuda"), dtype=torch.float32):
+    def __init__(self, pretrained_ckpt='vggface2', im_size=(160, 160), device=None, dtype=torch.float32):
+        if device is None:
+            device = get_default_device()
         self.im_size = im_size
         self.device = device
         self.mtcnn = MTCNN(image_size=im_size, device=device)
@@ -68,7 +78,8 @@ class FaceFeatExtract:
 def get_face_ratios(exp_data: ExperimentDataset, backend_model="buffalo_l", save=True):
     """computes a ratio of face bb to img size for each image, saves ratios.json file in experiment directory"""
     ratios = dict()
-    face_app = FaceAnalysis(name=backend_model, providers=['CUDAExecutionProvider'])
+    providers = ['CUDAExecutionProvider'] if torch.cuda.is_available() else ['CPUExecutionProvider']
+    face_app = FaceAnalysis(name=backend_model, providers=providers)
 
     for idx, _, _, out_img in tqdm(iter(exp_data), desc= "building ratios.json for " + str(exp_data.exp_root), leave=True):
         # try to detect face
@@ -121,14 +132,22 @@ class FaceDistanceMetric(BaseMetric):
     def __init__(self, exp_name, dataset, filter_subset, **kwargs):
         super().__init__(exp_name, dataset, filter_subset, **kwargs)
         self.backend_model = "buffalo_l"
-        device_id = torch.cuda.current_device()
-        # TODO: remove this
-        device_id = self.device.index
+
+        # Set providers based on device availability
+        if torch.cuda.is_available() and 'cuda' in str(self.device):
+            device_id = self.device.index if hasattr(self.device, 'index') and self.device.index is not None else 0
+            providers = ['CUDAExecutionProvider']
+            provider_options = [{"device_id": device_id}]
+        else:
+            device_id = 0
+            providers = ['CPUExecutionProvider']
+            provider_options = [{}]
+
         self.face_app = FaceAnalysis(
-            name=self.backend_model, 
-            providers=['CUDAExecutionProvider'],
-            provider_options=[{"device_id": device_id}])
-        self.face_app.prepare(ctx_id=device_id, det_size=(640, 640))
+            name=self.backend_model,
+            providers=providers,
+            provider_options=provider_options)
+        self.face_app.prepare(ctx_id=0, det_size=(640, 640))
         self.sim = nn.CosineSimilarity(dim=0)
         self.extract_fail_cnt = 0
 

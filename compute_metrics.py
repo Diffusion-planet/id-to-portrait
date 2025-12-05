@@ -79,9 +79,13 @@ def main(
     save_raw,
 ):
 
-    if not torch.cuda.is_available(): 
-        raise ValueError("No GPU available")
-    DEVICE = torch.device(f"cuda:{deviceid}")
+    if torch.cuda.is_available():
+        DEVICE = torch.device(f"cuda:{deviceid}")
+    elif torch.backends.mps.is_available():
+        DEVICE = torch.device("mps")
+    else:
+        DEVICE = torch.device("cpu")
+        print("Warning: Running on CPU, this will be slow")
 
     flagfail = 0
     for exp_dir in exp_runs:

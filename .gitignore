@@ -1,5 +1,11 @@
 venv/
+venv_mps/
 env/
+node_modules/
+.next/
+backend/uploads/
+.env.local
+.env
 data/
 res/
 final_res/

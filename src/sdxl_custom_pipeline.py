@@ -129,30 +129,82 @@ class DecoupledGuidancePipelineXL(StableDiffusionXLPipeline):
         prompt,
         generator,
         pipe_kwargs,
-        after_hook_fn=None
+        after_hook_fn=None,
+        style_image=None,
+        style_strength=0.3,
     ):
+        from PIL import Image
+
         id_embeds, _ = get_faceid_embeds(
             self,
             self.app,
-            face_image, 
-            "plus-v2", 
+            face_image,
+            "plus-v2",
             do_cfg=True,
             decoupled=True,
             dcg_type=pipe_kwargs["dcg_kwargs"]["dcg_type"]
         )
+
+        print(f">>> [DEBUG] face_image: {face_image}")
+        print(f">>> [DEBUG] id_embeds is None: {id_embeds is None}")
+        if id_embeds is not None:
+            print(f">>> [DEBUG] id_embeds shape: {id_embeds.shape}")
+
+        # Prepare style latents for img2img approach
+        init_latents = None
+        if style_image is not None:
+            height = pipe_kwargs.get("height", 1024)
+            width = pipe_kwargs.get("width", 1024)
+            init_latents = self._prepare_style_latents(
+                style_image, height, width, generator, torch.float16
+            )
+            print(f">>> [DEBUG] style_latents shape: {init_latents.shape}, strength: {style_strength}")
+
+        # Invert style_strength to denoising_strength:
+        # High style_strength = preserve more style = lower denoising
+        # Low style_strength = change more = higher denoising
+        denoising = 1.0 - style_strength if init_latents is not None else 1.0
 
         res = self(
             prompt=prompt,
             ip_adapter_image_embeds=[id_embeds],
             num_images_per_prompt=1,
             generator=generator,
+            init_latents=init_latents,
+            denoising_strength=denoising,
             **pipe_kwargs
         ).images[0]
-        
+
         if after_hook_fn is not None:
             after_hook_fn(self, res)
-        
+
         return res
+
+    def _prepare_style_latents(self, style_image, height, width, generator, dtype):
+        """Encode style image to latents for img2img style transfer"""
+        from PIL import Image
+        import torchvision.transforms.functional as TF
+
+        if isinstance(style_image, str):
+            style_image = Image.open(style_image).convert("RGB")
+
+        # Resize to target dimensions
+        style_image = style_image.resize((width, height), Image.LANCZOS)
+
+        # Convert to tensor: [0, 255] -> [-1, 1]
+        style_tensor = TF.to_tensor(style_image).unsqueeze(0)  # [1, 3, H, W]
+        style_tensor = (style_tensor * 2.0 - 1.0).to(self.device, dtype=dtype)
+
+        # Encode with VAE
+        with torch.no_grad():
+            encoded = self.vae.encode(style_tensor)
+            if hasattr(encoded, 'latent_dist'):
+                init_latents = encoded.latent_dist.sample(generator)
+            else:
+                init_latents = encoded.latents
+            init_latents = init_latents * self.vae.config.scaling_factor
+
+        return init_latents
 
     def __call__(
         self,
@@ -194,6 +246,8 @@ class DecoupledGuidancePipelineXL(StableDiffusionXLPipeline):
         clip_skip: Optional[int] = None,
         callback_on_step_end = None,
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
+        init_latents: Optional[torch.Tensor] = None,
+        denoising_strength: float = 1.0,
         **kwargs,
     ):
         callback = kwargs.pop("callback", None)
@@ -271,20 +325,51 @@ class DecoupledGuidancePipelineXL(StableDiffusionXLPipeline):
         # 4. Prepare timesteps
         timesteps, num_inference_steps = retrieve_timesteps(
             self.scheduler, num_inference_steps, device, timesteps, sigmas
-        )        
+        )
+
+        # 4.1 Handle img2img: adjust timesteps based on denoising_strength
+        if init_latents is not None and denoising_strength < 1.0:
+            # Calculate how many steps to skip (more strength = less skip = more change)
+            init_timestep = min(int(num_inference_steps * denoising_strength), num_inference_steps)
+            t_start = max(num_inference_steps - init_timestep, 0)
+            timesteps = timesteps[t_start * self.scheduler.order:]
+            num_inference_steps = num_inference_steps - t_start
+            print(f">>> [DEBUG] img2img: skipping {t_start} steps, running {num_inference_steps} steps")
 
         # 5. Prepare latent variables
         num_channels_latents = self.unet.config.in_channels
-        latents = self.prepare_latents(
-            batch_size * num_images_per_prompt,
-            num_channels_latents,
-            height,
-            width,
-            prompt_embeds.dtype,
-            device,
-            generator,
-            latents,
-        )
+
+        if init_latents is not None:
+            # img2img mode: use style image latents with added noise
+            init_latents = init_latents.to(device=device, dtype=prompt_embeds.dtype)
+
+            # Add noise to init_latents at the starting timestep
+            noise = torch.randn(
+                init_latents.shape,
+                generator=generator,
+                device=device,
+                dtype=init_latents.dtype
+            )
+
+            # Get the starting timestep
+            if len(timesteps) > 0:
+                latent_timestep = timesteps[:1]
+                latents = self.scheduler.add_noise(init_latents, noise, latent_timestep)
+            else:
+                latents = init_latents
+            print(f">>> [DEBUG] img2img latents prepared, shape: {latents.shape}")
+        else:
+            # txt2img mode: generate random latents
+            latents = self.prepare_latents(
+                batch_size * num_images_per_prompt,
+                num_channels_latents,
+                height,
+                width,
+                prompt_embeds.dtype,
+                device,
+                generator,
+                latents,
+            )
 
         # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
@@ -657,9 +742,19 @@ def get_faceid_pipeline(config, device):
         pipe.set_ip_adapter_scale(ip_adapter_scale)
         pipe.track_norms=False
 
-    device_id = device.index if hasattr(device, 'index') else 0
-    print("DEVICE ID: ", device_id)
-    app = FaceAnalysis(name="buffalo_l", providers=['CUDAExecutionProvider', 'CPUExecutionProvider'], provider_options=[{"device_id": device_id}, {}])
+    # Set up FaceAnalysis providers based on device type
+    if torch.cuda.is_available() and 'cuda' in str(device):
+        device_id = device.index if hasattr(device, 'index') and device.index is not None else 0
+        providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+        provider_options = [{"device_id": device_id}, {}]
+    else:
+        # MPS or CPU - use CPU provider for ONNX (insightface doesn't support MPS directly)
+        device_id = 0
+        providers = ['CPUExecutionProvider']
+        provider_options = [{}]
+
+    print("DEVICE: ", device, " | FaceAnalysis providers: ", providers)
+    app = FaceAnalysis(name="buffalo_l", providers=providers, provider_options=provider_options)
     app.prepare(ctx_id=0, det_size=(640, 640))
     pipe.app = app
 

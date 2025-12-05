@@ -18,7 +18,7 @@ from src.custom_dca import patch_pipe, reset_patched_unet
 @click.option("--lora_scale", nargs=1, type=float, default=0.6, help="lora_scale for additional loras inside unet, correspond to 'human-centric' bias")
 @click.option("--id_img_path", nargs=1, type=str, default=None, help="path to image with identity")
 @click.option("--prompt", nargs=1, type=str, default=None, help="text description for generation")
-@click.option("--device", nargs=1, type=str, default="cuda:0")
+@click.option("--device", nargs=1, type=str, default="mps")
 @click.option("--seed", nargs=1, type=int, default=42, help="random seed for generation")
 def main(
     config_dir, 
@@ -61,11 +61,14 @@ def main(
     
     # for colab demo use pruned cheap vae
     pipe.vae = AutoencoderTiny.from_pretrained(
-        "madebyollin/taesdxl", 
+        "madebyollin/taesdxl",
         torch_dtype=torch.float16,
         cache_dir="models_cache/"
     ).to(DEVICE)
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    elif torch.backends.mps.is_available():
+        torch.mps.empty_cache()
     gc.collect()
 
     if conf["method"] == "faceid" and "faceid_lora_scale" in conf:

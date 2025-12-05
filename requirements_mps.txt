@@ -1,0 +1,41 @@
+# FastFace MPS (Mac Apple Silicon) Requirements
+# Python 3.10 or 3.11 recommended
+
+# PyTorch with MPS support
+torch==2.2.2
+torchvision==0.17.2
+
+# Diffusers and related
+diffusers==0.31.0
+peft==0.13.2
+huggingface-hub==0.26.2
+safetensors
+transformers
+
+# Core dependencies
+numpy==1.26.4
+matplotlib==3.9.2
+jupyter==1.1.1
+click==8.1.7
+frozenlist==1.5.0
+pillow==10.2.0
+
+# Face detection/recognition
+insightface==0.7.3
+onnx==1.17.0
+onnxruntime==1.18.0
+
+# FaceNet (MPS compatible)
+facenet-pytorch==2.6.0
+
+# Image metrics
+image-reward==1.5
+
+# CLIP
+clip @ git+https://github.com/openai/CLIP.git@dcba3cb2e2827b402d2701e7e1c7d9fed8a20ef1
+
+# OpenCV
+opencv-python
+
+# tqdm for progress bars
+tqdm
