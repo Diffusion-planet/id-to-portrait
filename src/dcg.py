@@ -8,9 +8,9 @@ from .cfg_schedulers import (
 
 
 def decoupled_cfg_predict(
-    noise_pred, 
-    a, 
-    b, 
+    noise_pred,
+    a,
+    b,
     step,
     dcg_type=1,
     term_preproc="",
@@ -24,25 +24,36 @@ def decoupled_cfg_predict(
     **kwargs,
 ):
     out = dict()
-    uncond, out1, out2 = noise_pred.chunk(3)
-    # NOTE: method and paper correspond to dcg_type == 3
-    if dcg_type in [1, 3]:
-        # 1) out1, out2 = eps_t, eps_ti
-        # 3) out1, out2 = eps_i, eps_ti
-        term1 = out1 - uncond
-        term2 = out2 - out1
-    elif dcg_type == 2:
-        # out1, out2 = eps_t, eps_i
-        term1 = out1 - uncond
-        term2 = out2 - uncond
 
-    if return_norms:
-        out["norms"]=[torch.norm(t).cpu().item() for t in (uncond, out1, out2, term1, term2)]
+    # DCG Type 4: Dual Adapter mode with 4 batches
+    # [uncond, face_only, style_only, face+text]
+    if dcg_type == 4:
+        uncond, face_pred, style_pred, combined_pred = noise_pred.chunk(4)
+        term1 = face_pred - uncond      # Face guidance term
+        term2 = style_pred - uncond     # Style guidance term
+
+        if return_norms:
+            out["norms"] = [torch.norm(t).cpu().item() for t in (uncond, face_pred, style_pred, term1, term2)]
+    else:
+        uncond, out1, out2 = noise_pred.chunk(3)
+        # NOTE: method and paper correspond to dcg_type == 3
+        if dcg_type in [1, 3]:
+            # 1) out1, out2 = eps_t, eps_ti
+            # 3) out1, out2 = eps_i, eps_ti
+            term1 = out1 - uncond
+            term2 = out2 - out1
+        elif dcg_type == 2:
+            # out1, out2 = eps_t, eps_i
+            term1 = out1 - uncond
+            term2 = out2 - uncond
+
+        if return_norms:
+            out["norms"]=[torch.norm(t).cpu().item() for t in (uncond, out1, out2, term1, term2)]
 
     if "renorm" in term_preproc:
         term2 *= torch.norm(term1) / torch.norm(term2)
 
-    # apply scheduler and pass additional args 
+    # apply scheduler and pass additional args
     step_idx, t = step
     if a_scheduler != "custom":
         a = get_scheduler(a_scheduler)(a, t, log=True, **sch_kwargs["a"])
@@ -58,13 +69,18 @@ def decoupled_cfg_predict(
             w_values=sch_kwargs["custom"]["b"]
         )
         b = custom_sch(b, step_idx)
-    
+
     # dcg prediction
+    # For dcg_type 4: pred = uncond + a*(face-uncond) + b*(style-uncond)
     pred = uncond + a * term1 + b * term2
 
     if term_postproc.startswith("rescale"): # inspired by https://arxiv.org/pdf/2305.08891, Alg. 2
-        std1 = out1.std([1, 2, 3], keepdim=True)
-        std2 = out2.std([1, 2, 3], keepdim=True)
+        if dcg_type == 4:
+            std1 = face_pred.std([1, 2, 3], keepdim=True)
+            std2 = style_pred.std([1, 2, 3], keepdim=True)
+        else:
+            std1 = out1.std([1, 2, 3], keepdim=True)
+            std2 = out2.std([1, 2, 3], keepdim=True)
         std_dcg = pred.std([1, 2, 3], keepdim=True)
         factor = (std1 + std2) / (2 * std_dcg)
         factor = rescale * factor + (1 - rescale)

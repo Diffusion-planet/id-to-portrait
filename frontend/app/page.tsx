@@ -18,16 +18,19 @@ import {
   getImageUrl,
   checkHealth,
   getHistory,
-  createHistory,
   updateHistory as updateHistoryApi,
   deleteHistory as deleteHistoryApi,
   getFolders,
   createFolder as createFolderApi,
   updateFolder as updateFolderApi,
   deleteFolder as deleteFolderApi,
+  getTaskStatus,
+  getActiveTasks,
+  generatePromptFromImages,
   type Model,
   type HistoryItem,
   type Folder,
+  type Task,
 } from '@/lib/api'
 
 // Tips for loading state
@@ -310,16 +313,30 @@ function getDefaultTitle() {
   })
 }
 
+// localStorage key for form state
+const FORM_STATE_KEY = 'prometheus_form_state'
+
+// Default prompts
+const DEFAULT_PROMPT = 'professional portrait photo, natural skin texture, soft studio lighting, sharp focus, neutral background, high resolution, photorealistic'
+const DEFAULT_NEGATIVE_PROMPT = 'plastic skin, waxy, smooth skin, blurry, noise, artifacts, distorted, deformed, ugly, low quality, oversaturated, cartoon, anime, painting, illustration, 3d render'
+
 export default function Home() {
-  // State
+  // State - use defaults initially, load from localStorage in useEffect
   const [models, setModels] = useState<Model[]>([])
   const [selectedModel, setSelectedModel] = useState('hyper')
-  const [prompt, setPrompt] = useState('')
+  const [prompt, setPrompt] = useState(DEFAULT_PROMPT)
+  const [negativePrompt, setNegativePrompt] = useState(DEFAULT_NEGATIVE_PROMPT)
+  const [isGeneratingPrompt, setIsGeneratingPrompt] = useState(false)
+  const [promptTypingTarget, setPromptTypingTarget] = useState<{ positive: string; negative: string } | null>(null)
   const [ips, setIps] = useState(0.8)
   const [loraScale, setLoraScale] = useState(0.6)
   const [seed, setSeed] = useState(42)
   const [styleStrength, setStyleStrength] = useState(0.3)
+  const [inferenceSteps, setInferenceSteps] = useState(4)
+  const [dualAdapterMode, setDualAdapterMode] = useState(true)
+  const [useTinyVae, setUseTinyVae] = useState(false) // Full VAE by default for better quality
   const [title, setTitle] = useState('')
+  const [isHydrated, setIsHydrated] = useState(false)
 
   const [uploadedImage, setUploadedImage] = useState<{ id: string; url: string } | null>(null)
   const [styleImage, setStyleImage] = useState<{ id: string; url: string } | null>(null)
@@ -334,15 +351,65 @@ export default function Home() {
   const [isUploadingStyle, setIsUploadingStyle] = useState(false)
   const [currentTip, setCurrentTip] = useState(0)
 
+  // Task tracking for generation
+  const [activeTask, setActiveTask] = useState<Task | null>(null)
+  const pollingRef = useRef<NodeJS.Timeout | null>(null)
+  const [displayedMessage, setDisplayedMessage] = useState('')
+  const [targetMessage, setTargetMessage] = useState('')
+
   // History and Sidebar state
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [history, setHistory] = useState<HistoryItem[]>([])
   const [folders, setFolders] = useState<Folder[]>([])
   const [selectedHistoryId, setSelectedHistoryId] = useState<string | null>(null)
+  const [viewingHistory, setViewingHistory] = useState<HistoryItem | null>(null)
 
   const fileInputRef = useRef<HTMLInputElement>(null)
   const styleFileInputRef = useRef<HTMLInputElement>(null)
   const dropdownRef = useRef<HTMLDivElement>(null)
+
+  // Poll for task status
+  const startPolling = useCallback((taskId: string) => {
+    if (pollingRef.current) {
+      clearInterval(pollingRef.current)
+    }
+
+    const poll = async () => {
+      try {
+        const task = await getTaskStatus(taskId)
+        setActiveTask(task)
+
+        if (task.status === 'completed') {
+          setIsGenerating(false)
+          setGeneratedImage(task.image_url ? getImageUrl(task.image_url) : null)
+          // Refresh history to get the new item
+          const historyRes = await getHistory()
+          setHistory(historyRes.history)
+          if (task.history_id) {
+            setSelectedHistoryId(task.history_id)
+          }
+          setActiveTask(null)
+          if (pollingRef.current) {
+            clearInterval(pollingRef.current)
+            pollingRef.current = null
+          }
+        } else if (task.status === 'failed') {
+          setIsGenerating(false)
+          setError(task.error || 'Generation failed')
+          setActiveTask(null)
+          if (pollingRef.current) {
+            clearInterval(pollingRef.current)
+            pollingRef.current = null
+          }
+        }
+      } catch (e) {
+        console.error('Polling error:', e)
+      }
+    }
+
+    poll() // Initial poll
+    pollingRef.current = setInterval(poll, 1000)
+  }, [])
 
   // Check API health and fetch models, history, folders
   useEffect(() => {
@@ -350,20 +417,44 @@ export default function Home() {
       try {
         await checkHealth()
         setApiStatus('online')
-        const [modelsRes, historyRes, foldersRes] = await Promise.all([
+        const [modelsRes, historyRes, foldersRes, tasksRes] = await Promise.all([
           getModels(),
           getHistory(),
           getFolders(),
+          getActiveTasks(),
         ])
         setModels(modelsRes.models)
         setHistory(historyRes.history)
         setFolders(foldersRes.folders)
+
+        // Resume any active task
+        if (tasksRes.tasks.length > 0) {
+          const task = tasksRes.tasks[0]
+          setActiveTask(task)
+          setIsGenerating(true)
+          // Restore input images from task
+          if (task.input_image_url) {
+            const imageId = task.params.image_id
+            setUploadedImage({ id: imageId, url: task.input_image_url })
+          }
+          if (task.style_image_url && task.params.style_image_id) {
+            setStyleImage({ id: task.params.style_image_id, url: task.style_image_url })
+          }
+          startPolling(task.id)
+        }
       } catch {
         setApiStatus('offline')
       }
     }
     init()
-  }, [])
+
+    // Cleanup polling on unmount
+    return () => {
+      if (pollingRef.current) {
+        clearInterval(pollingRef.current)
+      }
+    }
+  }, [startPolling])
 
   // Tip carousel during generation
   useEffect(() => {
@@ -373,6 +464,58 @@ export default function Home() {
     }, 4000)
     return () => clearInterval(interval)
   }, [isGenerating])
+
+  // Update target message when activeTask changes
+  useEffect(() => {
+    if (activeTask?.progress_message) {
+      setTargetMessage(activeTask.progress_message)
+    }
+  }, [activeTask?.progress_message])
+
+  // Typing effect for progress message
+  useEffect(() => {
+    if (!targetMessage) {
+      setDisplayedMessage('')
+      return
+    }
+
+    // If displayed message is a prefix of target, continue typing
+    if (targetMessage.startsWith(displayedMessage) && displayedMessage !== targetMessage) {
+      const timeout = setTimeout(() => {
+        setDisplayedMessage(targetMessage.slice(0, displayedMessage.length + 1))
+      }, 30)
+      return () => clearTimeout(timeout)
+    }
+
+    // If target changed completely, start fresh
+    if (!targetMessage.startsWith(displayedMessage)) {
+      setDisplayedMessage('')
+    }
+  }, [targetMessage, displayedMessage])
+
+  // Typing effect for AI-generated prompts
+  useEffect(() => {
+    if (!promptTypingTarget) return
+
+    const { positive, negative } = promptTypingTarget
+
+    // Type positive prompt first, then negative
+    if (prompt.length < positive.length) {
+      const timeout = setTimeout(() => {
+        setPrompt(positive.slice(0, prompt.length + 1))
+      }, 15)
+      return () => clearTimeout(timeout)
+    } else if (negativePrompt.length < negative.length) {
+      const timeout = setTimeout(() => {
+        setNegativePrompt(negative.slice(0, negativePrompt.length + 1))
+      }, 15)
+      return () => clearTimeout(timeout)
+    } else {
+      // Done typing
+      setPromptTypingTarget(null)
+      setIsGeneratingPrompt(false)
+    }
+  }, [promptTypingTarget, prompt, negativePrompt])
 
   // Close dropdown on outside click
   useEffect(() => {
@@ -384,6 +527,51 @@ export default function Home() {
     document.addEventListener('mousedown', handleClickOutside)
     return () => document.removeEventListener('mousedown', handleClickOutside)
   }, [])
+
+  // Load form state from localStorage after hydration
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem(FORM_STATE_KEY)
+      if (saved) {
+        const state = JSON.parse(saved)
+        if (state.selectedModel) setSelectedModel(state.selectedModel)
+        if (state.prompt) setPrompt(state.prompt)
+        if (state.negativePrompt) setNegativePrompt(state.negativePrompt)
+        if (state.ips !== undefined) setIps(state.ips)
+        if (state.loraScale !== undefined) setLoraScale(state.loraScale)
+        if (state.seed !== undefined) setSeed(state.seed)
+        if (state.styleStrength !== undefined) setStyleStrength(state.styleStrength)
+        if (state.inferenceSteps !== undefined) setInferenceSteps(state.inferenceSteps)
+        if (state.dualAdapterMode !== undefined) setDualAdapterMode(state.dualAdapterMode)
+        if (state.useTinyVae !== undefined) setUseTinyVae(state.useTinyVae)
+      }
+    } catch {
+      // Ignore parse errors
+    }
+    setIsHydrated(true)
+  }, [])
+
+  // Save form state to localStorage (only after hydration)
+  useEffect(() => {
+    if (!isHydrated) return
+    const state = {
+      selectedModel,
+      prompt,
+      negativePrompt,
+      ips,
+      loraScale,
+      seed,
+      styleStrength,
+      inferenceSteps,
+      dualAdapterMode,
+      useTinyVae,
+    }
+    try {
+      localStorage.setItem(FORM_STATE_KEY, JSON.stringify(state))
+    } catch {
+      // Ignore storage errors (quota exceeded, etc.)
+    }
+  }, [isHydrated, selectedModel, prompt, negativePrompt, ips, loraScale, seed, styleStrength, inferenceSteps, dualAdapterMode, useTinyVae])
 
   // Handle file upload for face reference
   const handleFileSelect = useCallback(async (file: File) => {
@@ -479,49 +667,56 @@ export default function Home() {
     setGeneratedImage(null)
     setCurrentTip(0)
     setSelectedHistoryId(null)
+    setViewingHistory(null)
+    setDisplayedMessage('')
+    setTargetMessage('')
 
     try {
       const result = await generateImage({
         image_id: uploadedImage.id,
         prompt: prompt.trim(),
+        negative_prompt: negativePrompt.trim() || undefined,
         model_name: selectedModel,
         ips,
         lora_scale: loraScale,
         seed,
         style_image_id: styleImage?.id || null,
         style_strength: styleImage ? styleStrength : undefined,
+        inference_steps: inferenceSteps,
+        dual_adapter_mode: styleImage ? dualAdapterMode : false,
+        title: title.trim() || getDefaultTitle(),
+        use_tiny_vae: useTinyVae,
       })
 
-      if (result.success && result.image_url) {
-        const generatedUrl = getImageUrl(result.image_url)
-        setGeneratedImage(generatedUrl)
-
-        // Save to history
-        const historyTitle = title.trim() || getDefaultTitle()
-        try {
-          const { item } = await createHistory({
-            title: historyTitle,
-            input_image_url: uploadedImage.url.replace(getImageUrl(''), ''),
-            output_image_url: result.image_url,
-            model_name: selectedModel,
-            prompt: prompt.trim(),
-            ips,
-            lora_scale: loraScale,
-            seed,
-          })
-          setHistory((prev) => [item, ...prev])
-          setSelectedHistoryId(item.id)
-          setTitle('')
-        } catch (e) {
-          console.error('Failed to save history:', e)
-        }
+      if (result.success && result.task_id) {
+        // Start polling for task completion
+        startPolling(result.task_id)
+        setTitle('')
       } else {
-        setError(result.error || '이미지 생성에 실패했습니다.')
+        setError('이미지 생성 요청에 실패했습니다.')
+        setIsGenerating(false)
       }
     } catch {
       setError('이미지 생성 중 오류가 발생했습니다.')
-    } finally {
       setIsGenerating(false)
+    }
+  }
+
+  // Return to active generation from history view
+  const handleReturnToGeneration = () => {
+    setViewingHistory(null)
+    setSelectedHistoryId(activeTask?.history_id || null)
+
+    // Restore input images from active task
+    if (activeTask) {
+      if (activeTask.input_image_url) {
+        setUploadedImage({ id: activeTask.params.image_id, url: activeTask.input_image_url })
+      }
+      if (activeTask.style_image_url && activeTask.params.style_image_id) {
+        setStyleImage({ id: activeTask.params.style_image_id, url: activeTask.style_image_url })
+      }
+      // Clear generated image since we're still generating
+      setGeneratedImage(null)
     }
   }
 
@@ -546,20 +741,86 @@ export default function Home() {
     setSeed(Math.floor(Math.random() * 999999))
   }
 
+  // Generate prompts using VLM (Gemini)
+  const handleGeneratePrompt = async () => {
+    if (!uploadedImage) {
+      setError('프롬프트 생성을 위해 먼저 얼굴 이미지를 업로드해주세요.')
+      return
+    }
+
+    setIsGeneratingPrompt(true)
+    setError(null)
+    // Clear existing prompts for typing effect
+    setPrompt('')
+    setNegativePrompt('')
+
+    try {
+      const result = await generatePromptFromImages(
+        uploadedImage.id,
+        styleImage?.id || null
+      )
+
+      if (result.success) {
+        // Start typing effect
+        setPromptTypingTarget({
+          positive: result.positive,
+          negative: result.negative,
+        })
+      } else {
+        setError('프롬프트 생성에 실패했습니다.')
+        setIsGeneratingPrompt(false)
+      }
+    } catch (e) {
+      console.error('Prompt generation error:', e)
+      setError('프롬프트 생성 중 오류가 발생했습니다.')
+      setIsGeneratingPrompt(false)
+    }
+  }
+
+  // Start new generation (clear current state)
+  const handleNewGeneration = () => {
+    setUploadedImage(null)
+    setStyleImage(null)
+    setGeneratedImage(null)
+    setSelectedHistoryId(null)
+    setViewingHistory(null)
+    setTitle('')
+    setError(null)
+    // Keep other settings (prompt, model, etc.) as they are
+  }
+
   // History handlers
   const handleSelectHistory = (item: HistoryItem) => {
     setSelectedHistoryId(item.id)
+    setViewingHistory(item)
+
     // Extract file ID from input image URL (e.g., /uploads/uuid.ext -> uuid)
     const inputPath = item.input_image_url
     const fileName = inputPath.split('/').pop() || ''
     const fileId = fileName.split('.')[0] || ''
     setUploadedImage({ id: fileId, url: getImageUrl(item.input_image_url) })
+
+    // Restore style image if exists
+    if (item.style_image_url) {
+      const stylePath = item.style_image_url
+      const styleFileName = stylePath.split('/').pop() || ''
+      const styleFileId = styleFileName.split('.')[0] || ''
+      setStyleImage({ id: styleFileId, url: getImageUrl(item.style_image_url) })
+    } else {
+      setStyleImage(null)
+    }
+
     setGeneratedImage(getImageUrl(item.output_image_url))
     setPrompt(item.settings.prompt)
+    setNegativePrompt(item.settings.negative_prompt || '')
     setSelectedModel(item.settings.model_name)
     setIps(item.settings.ips)
     setLoraScale(item.settings.lora_scale)
     setSeed(item.settings.seed)
+    setStyleStrength(item.settings.style_strength ?? 0.3)
+    setInferenceSteps(item.settings.inference_steps ?? 4)
+    setDualAdapterMode(item.settings.dual_adapter_mode ?? true)
+    setUseTinyVae(item.settings.use_tiny_vae ?? false)
     setTitle(item.title)
     setSidebarOpen(false)
   }
@@ -684,18 +945,50 @@ export default function Home() {
       </header>
 
       <main className="p-6 max-w-7xl mx-auto">
+        {/* Return to generation banner */}
+        {isGenerating && viewingHistory && (
+          <div className="mb-4 p-4 bg-black text-white rounded-2xl flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              <div className="w-8 h-8 rounded-lg bg-white/20 flex items-center justify-center">
+                <LoaderIcon size={16} className="text-white" />
+              </div>
+              <div>
+                <p className="text-sm font-medium">이미지 생성 중...</p>
+                <p className="text-xs text-white/60">히스토리를 보는 중입니다</p>
+              </div>
+            </div>
+            <button
+              onClick={handleReturnToGeneration}
+              className="px-4 py-2 bg-white text-black text-sm font-medium rounded-xl hover:bg-neutral-100 transition-colors"
+            >
+              생성 화면으로 돌아가기
+            </button>
+          </div>
+        )}
+
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
           {/* Left Column - Input */}
           <div className="space-y-6">
             {/* Title Input */}
             <section className="card-elevated p-4">
-              <input
-                type="text"
-                value={title}
-                onChange={(e) => setTitle(e.target.value)}
-                placeholder={getDefaultTitle()}
-                className="w-full text-lg font-medium bg-transparent border-0 focus:outline-none placeholder:text-neutral-300"
-              />
+              <div className="flex items-center gap-3">
+                <input
+                  type="text"
+                  value={title}
+                  onChange={(e) => setTitle(e.target.value)}
+                  placeholder={getDefaultTitle()}
+                  className="flex-1 text-lg font-medium bg-transparent border-0 focus:outline-none placeholder:text-neutral-300"
+                />
+                {(uploadedImage || generatedImage) && (
+                  <button
+                    onClick={handleNewGeneration}
+                    className="flex items-center gap-1.5 px-3.5 py-2 text-sm font-medium bg-neutral-100 hover:bg-black hover:text-white text-neutral-700 rounded-xl transition-all whitespace-nowrap shadow-sm hover:shadow-md btn-press"
+                  >
+                    <RefreshIcon size={14} />
+                    <span>새로 시작</span>
+                  </button>
+                )}
+              </div>
               <p className="text-xs text-neutral-400 mt-1">비워두면 현재 시간으로 저장됩니다</p>
             </section>
 
@@ -713,7 +1006,7 @@ export default function Home() {
                     <span className="text-xs font-medium text-neutral-600">얼굴 참조</span>
                     {uploadedImage && (
                       <button
-                        onClick={() => setUploadedImage(null)}
+                        onClick={() => fileInputRef.current?.click()}
                         className="text-[10px] text-neutral-400 hover:text-black transition-colors"
                       >
                         변경
@@ -733,11 +1026,11 @@ export default function Home() {
                     onDragLeave={handleDragLeave}
                   >
                     {uploadedImage ? (
-                      <div className="relative group">
+                      <div className="relative group aspect-[3/4]">
                         <img
                           src={uploadedImage.url}
                           alt="Face reference"
-                          className="w-full h-auto max-h-[280px] object-contain"
+                          className="w-full h-full object-cover"
                         />
                         <div className="absolute inset-0 bg-black/0 group-hover:bg-black/10 transition-all duration-300" />
                       </div>
@@ -848,7 +1141,7 @@ export default function Home() {
                     <span className="text-xs font-medium text-neutral-600">스타일 참조</span>
                     {styleImage && (
                       <button
-                        onClick={() => setStyleImage(null)}
+                        onClick={() => styleFileInputRef.current?.click()}
                         className="text-[10px] text-neutral-400 hover:text-black transition-colors"
                       >
                         변경
@@ -868,11 +1161,11 @@ export default function Home() {
                     onDragLeave={handleStyleDragLeave}
                   >
                     {styleImage ? (
-                      <div className="relative group">
+                      <div className="relative group aspect-[3/4]">
                         <img
                           src={styleImage.url}
                           alt="Style reference"
-                          className="w-full h-auto max-h-[280px] object-contain"
+                          className="w-full h-full object-cover"
                         />
                         <div className="absolute inset-0 bg-black/0 group-hover:bg-black/10 transition-all duration-300" />
                       </div>
@@ -943,16 +1236,49 @@ export default function Home() {
 
             {/* Prompt */}
             <section className="card-elevated p-6">
-              <div className="mb-4">
-                <h3 className="text-sm font-semibold">프롬프트</h3>
-                <p className="text-xs text-neutral-400 mt-0.5">생성하고 싶은 이미지를 설명하세요</p>
+              <div className="flex items-start justify-between mb-4">
+                <div>
+                  <h3 className="text-sm font-semibold">프롬프트</h3>
+                  <p className="text-xs text-neutral-400 mt-0.5">생성하고 싶은 이미지를 설명하세요</p>
+                </div>
+                <button
+                  onClick={handleGeneratePrompt}
+                  disabled={!uploadedImage || isGeneratingPrompt}
+                  className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-neutral-100 hover:bg-black hover:text-white text-neutral-600 rounded-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed btn-press"
+                >
+                  {isGeneratingPrompt ? (
+                    <>
+                      <LoaderIcon size={12} className="animate-spin" />
+                      <span>생성 중...</span>
+                    </>
+                  ) : (
+                    <>
+                      <SparkleIcon size={12} />
+                      <span>AI 프롬프트</span>
+                    </>
+                  )}
+                </button>
               </div>
               <textarea
                 value={prompt}
                 onChange={(e) => setPrompt(e.target.value)}
                 placeholder="A professional portrait photo with soft studio lighting, neutral gray background..."
-                className="w-full h-32 px-4 py-3 text-sm bg-neutral-50 border-0 rounded-xl resize-none focus:outline-none focus:ring-2 focus:ring-black/10 focus:bg-white transition-all placeholder:text-neutral-400"
+                className="w-full h-24 px-4 py-3 text-sm bg-neutral-50 border-0 rounded-xl resize-none focus:outline-none focus:ring-2 focus:ring-black/10 focus:bg-white transition-all placeholder:text-neutral-400"
               />
+
+              {/* Negative Prompt */}
+              <div className="mt-4 pt-4 border-t border-neutral-100">
+                <div className="mb-3">
+                  <h4 className="text-xs font-medium text-neutral-500">Negative Prompt</h4>
+                  <p className="text-xs text-neutral-400 mt-0.5">피하고 싶은 요소를 입력하세요</p>
+                </div>
+                <textarea
+                  value={negativePrompt}
+                  onChange={(e) => setNegativePrompt(e.target.value)}
+                  placeholder="plastic skin, blurry, artifacts, distorted..."
+                  className="w-full h-20 px-4 py-3 text-sm bg-neutral-50 border-0 rounded-xl resize-none focus:outline-none focus:ring-2 focus:ring-black/10 focus:bg-white transition-all placeholder:text-neutral-400"
+                />
+              </div>
             </section>
 
             {/* Model Selection */}
@@ -991,6 +1317,12 @@ export default function Home() {
                         key={model.id}
                         onClick={() => {
                           setSelectedModel(model.id)
+                          // Reset inference steps to model's default when changing models
+                          if (model.default_steps) {
+                            setInferenceSteps(model.default_steps)
+                          } else if (model.valid_steps && model.valid_steps.length > 0) {
+                            setInferenceSteps(model.valid_steps[Math.floor(model.valid_steps.length / 2)])
+                          }
                           setShowModelDropdown(false)
                         }}
                         className={`w-full px-4 py-3.5 text-sm text-left transition-all flex items-center gap-3 ${
@@ -1045,18 +1377,114 @@ export default function Home() {
                 description="인물 중심 생성 강도를 조절합니다"
               />
 
-              {/* Style Strength - Only show when style image is uploaded */}
+              {/* Style Settings - Only show when style image is uploaded */}
               {styleImage && (
-                <VisualSlider
-                  value={styleStrength}
-                  onChange={setStyleStrength}
-                  min={0}
-                  max={1}
-                  step={0.05}
-                  label="스타일 강도"
-                  description="스타일 이미지의 영향력을 조절합니다"
-                />
+                <>
+                  {/* Dual Adapter Mode Toggle */}
+                  <div className="card-interactive p-5 relative z-0">
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <h4 className="text-sm font-medium">Dual Adapter Mode</h4>
+                        <p className="text-xs text-neutral-400 mt-0.5">
+                          {dualAdapterMode
+                            ? '얼굴과 스타일을 분리해서 처리합니다 (권장)'
+                            : 'img2img 방식으로 스타일을 적용합니다'}
+                        </p>
+                      </div>
+                      <button
+                        onClick={() => setDualAdapterMode(!dualAdapterMode)}
+                        className={`relative w-12 h-7 rounded-full transition-all ${
+                          dualAdapterMode ? 'bg-black' : 'bg-neutral-200'
+                        }`}
+                      >
+                        <span
+                          className={`absolute top-1 w-5 h-5 bg-white rounded-full shadow transition-all ${
+                            dualAdapterMode ? 'left-6' : 'left-1'
+                          }`}
+                        />
+                      </button>
+                    </div>
+                  </div>
+
+                  <VisualSlider
+                    value={styleStrength}
+                    onChange={setStyleStrength}
+                    min={0}
+                    max={1}
+                    step={0.05}
+                    label="스타일 강도"
+                    description={dualAdapterMode
+                      ? '스타일 CLIP 임베딩의 영향력을 조절합니다'
+                      : '스타일 이미지의 영향력을 조절합니다'}
+                  />
+                </>
               )}
+
+              {/* Inference Steps */}
+              <div className="card-interactive p-5 relative z-0">
+                <div className="flex items-start justify-between mb-4">
+                  <div>
+                    <h4 className="text-sm font-medium">생성 스텝</h4>
+                    <p className="text-xs text-neutral-400 mt-0.5">높을수록 품질 향상, 속도 감소</p>
+                  </div>
+                  <span className="text-sm font-mono font-semibold text-black">{inferenceSteps}</span>
+                </div>
+                <div className="flex gap-2">
+                  {(selectedModelData?.valid_steps || [1, 2, 4, 8]).map((step) => (
+                    <button
+                      key={step}
+                      onClick={() => setInferenceSteps(step)}
+                      className={`flex-1 py-2.5 text-sm font-medium rounded-xl transition-all ${
+                        inferenceSteps === step
+                          ? 'bg-black text-white shadow-lg'
+                          : 'bg-neutral-100 hover:bg-neutral-200 text-neutral-600'
+                      }`}
+                    >
+                      {step}
+                    </button>
+                  ))}
+                </div>
+                <p className="text-xs text-neutral-400 mt-3 text-center">
+                  {selectedModelData?.name || '모델'}에서 지원하는 스텝: {(selectedModelData?.valid_steps || []).join(', ')}
+                </p>
+              </div>
+
+              {/* VAE Selection */}
+              <div className="card-interactive p-5 relative z-0">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <h4 className="text-sm font-medium">VAE 디코더</h4>
+                    <p className="text-xs text-neutral-400 mt-0.5">
+                      {useTinyVae
+                        ? 'TinyVAE: 빠른 속도, 약간의 품질 손실'
+                        : 'Full VAE: 최고 품질, 느린 속도'}
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className={`text-xs font-medium ${!useTinyVae ? 'text-black' : 'text-neutral-400'}`}>Full</span>
+                    <button
+                      onClick={() => setUseTinyVae(!useTinyVae)}
+                      className={`relative w-12 h-7 rounded-full transition-all ${
+                        useTinyVae ? 'bg-black' : 'bg-neutral-200'
+                      }`}
+                    >
+                      <span
+                        className={`absolute top-1 w-5 h-5 bg-white rounded-full shadow transition-all ${
+                          useTinyVae ? 'left-6' : 'left-1'
+                        }`}
+                      />
+                    </button>
+                    <span className={`text-xs font-medium ${useTinyVae ? 'text-black' : 'text-neutral-400'}`}>Tiny</span>
+                  </div>
+                </div>
+                <div className="mt-3 p-3 bg-neutral-50 rounded-xl">
+                  <p className="text-xs text-neutral-500 leading-relaxed">
+                    {useTinyVae
+                      ? 'TinyVAE는 디코딩 속도가 빠르지만, 피부 질감과 세밀한 디테일이 약간 뭉개질 수 있습니다.'
+                      : 'Full VAE는 피부 질감, 머리카락 등 세밀한 디테일을 최대한 보존합니다. 최종 결과물에 권장됩니다.'}
+                  </p>
+                </div>
+              </div>
 
               {/* Seed */}
               <div className="card-interactive p-5 relative z-0">
@@ -1116,7 +1544,7 @@ export default function Home() {
                 <h3 className="text-sm font-semibold">생성 결과</h3>
                 <p className="text-xs text-neutral-400 mt-0.5">생성된 이미지가 여기에 표시됩니다</p>
               </div>
-              <div className="relative min-h-[400px] bg-neutral-50">
+              <div className="relative min-h-[520px] bg-neutral-50">
                 {generatedImage ? (
                   <div className="relative group">
                     <img
@@ -1154,6 +1582,12 @@ export default function Home() {
                         <div className="text-center mb-8">
                           <p className="text-sm font-medium">이미지를 생성하고 있습니다</p>
                           <p className="text-xs text-neutral-400 mt-1.5">첫 실행 시 모델 로딩에 시간이 걸릴 수 있습니다</p>
+                          {displayedMessage && (
+                            <p className="text-xs text-neutral-500 mt-3 font-mono">
+                              {displayedMessage}
+                              <span className="animate-pulse">|</span>
+                            </p>
+                          )}
                         </div>
 
                         {/* Tip Carousel */}

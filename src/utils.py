@@ -89,11 +89,12 @@ def get_faceid_embeds(
         
         if not decoupled:
             clip_embeds = pipe.prepare_ip_adapter_image_embeds(
-                [ip_adapter_images], 
-                None, 
-                torch.device(pipe.device), 
-                batch_size, 
-                do_cfg)[0]
+                [ip_adapter_images],
+                None,
+                torch.device(pipe.device),
+                batch_size,
+                do_cfg,
+                do_decoupled_cfg=False)[0]
         else:
             # assert do_cfg # should be True
             clip_embeds = pipe.prepare_ip_adapter_image_embeds(

@@ -22,14 +22,44 @@ from .utils import get_faceid_embeds
 from .dcg import decoupled_cfg_predict
 
 
+def get_style_embeds(
+    pipe,
+    style_image,
+    do_cfg=False,
+    decoupled=False,
+    dcg_type=1,
+    batch_size=1,
+    dtype=torch.float16,
+):
+    """Get CLIP image embeddings for style transfer via IP-Adapter"""
+    from PIL import Image
+    import numpy as np
+
+    if isinstance(style_image, str):
+        style_image = Image.open(style_image).convert("RGB")
+
+    # Prepare image for CLIP
+    clip_embeds = pipe.prepare_ip_adapter_image_embeds(
+        [[style_image]],
+        None,
+        torch.device(pipe.device),
+        batch_size,
+        do_cfg,
+        do_decoupled_cfg=decoupled,
+        dcg_type=dcg_type
+    )[0]
+
+    return clip_embeds.to(dtype=dtype)
+
+
 class DecoupledGuidancePipelineXL(StableDiffusionXLPipeline):
     """pipeline to be used together with IpAdapter, adds separate image and textual guidance"""
     def prepare_ip_adapter_image_embeds(
-        self, 
-        ip_adapter_image, 
-        ip_adapter_image_embeds, 
-        device, 
-        num_images_per_prompt, 
+        self,
+        ip_adapter_image,
+        ip_adapter_image_embeds,
+        device,
+        num_images_per_prompt,
         do_classifier_free_guidance,
         do_decoupled_cfg,
         dcg_type=1,
@@ -37,7 +67,9 @@ class DecoupledGuidancePipelineXL(StableDiffusionXLPipeline):
         image_embeds = []
         if do_classifier_free_guidance:
             negative_image_embeds = []
+
         if ip_adapter_image_embeds is None:
+            # Encode images from scratch
             if not isinstance(ip_adapter_image, list):
                 ip_adapter_image = [ip_adapter_image]
 
@@ -58,27 +90,64 @@ class DecoupledGuidancePipelineXL(StableDiffusionXLPipeline):
                 if do_classifier_free_guidance:
                     negative_image_embeds.append(single_negative_image_embeds[None, :])
         else:
+            # Use pre-computed embeddings
             for single_image_embeds in ip_adapter_image_embeds:
-                if do_classifier_free_guidance:
-                    single_negative_image_embeds, single_image_embeds = single_image_embeds.chunk(2)
-                    negative_image_embeds.append(single_negative_image_embeds)
-                image_embeds.append(single_image_embeds)
+                # Check if embeddings are already stacked for DCG
+                # (batch size 3 for DCG type 1-3, batch size 4 for DCG type 4)
+                is_dcg_batched = (
+                    (dcg_type == 4 and single_image_embeds.shape[0] == 4) or
+                    (dcg_type in [1, 2, 3] and single_image_embeds.shape[0] == 3)
+                )
+                if is_dcg_batched:
+                    # Already properly stacked - use as-is
+                    image_embeds.append(single_image_embeds)
+                    if do_classifier_free_guidance:
+                        # First batch is the negative/uncond
+                        negative_image_embeds.append(single_image_embeds[0:1])
+                else:
+                    # Legacy behavior: split if chunked
+                    if do_classifier_free_guidance and single_image_embeds.shape[0] >= 2:
+                        single_negative_image_embeds, single_image_embeds = single_image_embeds.chunk(2)
+                        negative_image_embeds.append(single_negative_image_embeds)
+                    image_embeds.append(single_image_embeds)
 
         ip_adapter_image_embeds = []
         for i, single_image_embeds in enumerate(image_embeds):
+            # Check if already properly batched for DCG
+            is_dcg_batched = (
+                (dcg_type == 4 and single_image_embeds.shape[0] == 4) or
+                (dcg_type in [1, 2, 3] and single_image_embeds.shape[0] == 3)
+            )
+            if is_dcg_batched:
+                # Already stacked for DCG - use directly
+                single_image_embeds = single_image_embeds.to(device=device)
+                ip_adapter_image_embeds.append(single_image_embeds)
+                continue
+
+            # Original batching logic for other cases
             single_image_embeds = torch.cat([single_image_embeds] * num_images_per_prompt, dim=0)
             if do_classifier_free_guidance:
                 single_negative_image_embeds = torch.cat([negative_image_embeds[i]] * num_images_per_prompt, dim=0)
-                
+
                 if not do_decoupled_cfg:
                     single_image_embeds = torch.cat([single_negative_image_embeds, single_image_embeds], dim=0)
-                else: # add additional img embedding
+                elif dcg_type == 4:
+                    # Dual adapter mode: 4 batches (fallback if not pre-stacked)
+                    # [uncond, face_only, style_only, face+text]
+                    single_image_embeds = torch.cat([
+                        single_negative_image_embeds,  # uncond
+                        single_image_embeds,           # face_only
+                        single_image_embeds,           # style_only (same as face for now)
+                        single_image_embeds,           # face+text
+                    ], dim=0)
+                else:
+                    # DCG Type 1, 2, 3: 3 batches
                     embed = single_negative_image_embeds if dcg_type in [1, 2] else single_image_embeds
                     single_image_embeds = torch.cat([
                         single_negative_image_embeds,
-                        embed, 
-                        single_image_embeds], 
-                    dim=0)
+                        embed,
+                        single_image_embeds
+                    ], dim=0)
 
             single_image_embeds = single_image_embeds.to(device=device)
             ip_adapter_image_embeds.append(single_image_embeds)
@@ -119,6 +188,27 @@ class DecoupledGuidancePipelineXL(StableDiffusionXLPipeline):
             ], dim=0)
             add_text_embeds = torch.cat([negative_pooled_prompt_embeds, negative_pooled_prompt_embeds, add_text_embeds], dim=0)
             add_time_ids = torch.cat([negative_add_time_ids, negative_add_time_ids, add_time_ids], dim=0)
+        elif dcg_type == 4:
+            # Dual adapter mode: 4 batches
+            # [uncond, face_only (no text), style_only (no text), face+text]
+            prompt_embeds = torch.cat([
+                negative_prompt_embeds,   # uncond
+                negative_prompt_embeds,   # face_only (no text prompt)
+                negative_prompt_embeds,   # style_only (no text prompt)
+                prompt_embeds,            # face+text
+            ], dim=0)
+            add_text_embeds = torch.cat([
+                negative_pooled_prompt_embeds,
+                negative_pooled_prompt_embeds,
+                negative_pooled_prompt_embeds,
+                add_text_embeds
+            ], dim=0)
+            add_time_ids = torch.cat([
+                negative_add_time_ids,
+                negative_add_time_ids,
+                negative_add_time_ids,
+                add_time_ids
+            ], dim=0)
 
         return prompt_embeds, add_text_embeds, add_time_ids
 
@@ -132,53 +222,361 @@ class DecoupledGuidancePipelineXL(StableDiffusionXLPipeline):
         after_hook_fn=None,
         style_image=None,
         style_strength=0.3,
+        dual_adapter_mode=False,
+        negative_prompt=None,
+        progress_callback=None,
     ):
         from PIL import Image
 
-        id_embeds, _ = get_faceid_embeds(
-            self,
-            self.app,
-            face_image,
-            "plus-v2",
-            do_cfg=True,
-            decoupled=True,
-            dcg_type=pipe_kwargs["dcg_kwargs"]["dcg_type"]
-        )
+        dcg_type = pipe_kwargs["dcg_kwargs"]["dcg_type"]
 
-        print(f">>> [DEBUG] face_image: {face_image}")
-        print(f">>> [DEBUG] id_embeds is None: {id_embeds is None}")
-        if id_embeds is not None:
+        # Dual Adapter Mode v3: True Dual IP-Adapter Architecture
+        #
+        # Uses TWO separate IP-Adapters:
+        #   1. IP-Adapter FaceID Plus v2: For face identity (InsightFace + CLIP)
+        #   2. IP-Adapter Plus: For style transfer (general CLIP)
+        #
+        # Each adapter processes its own input independently:
+        #   - FaceID adapter: face_image → InsightFace embedding → face identity
+        #   - Style adapter: style_image → CLIP embedding → visual style
+        #
+        # This provides TRUE separation of face identity and style.
+        # No blending, no cross-contamination.
+
+        if dual_adapter_mode and style_image is not None and getattr(self, 'dual_adapter_enabled', False):
+            from PIL import Image
+            import cv2
+            import numpy as np
+            from insightface.utils import face_align
+
+            # 1. Extract Face ID embedding directly (avoid prepare_ip_adapter_image_embeds)
+            # This is needed because dual adapters expect 2 images, but we only have face image here
+            if isinstance(face_image, str):
+                face_pil = Image.open(face_image)
+            else:
+                face_pil = face_image
+            image = cv2.cvtColor(np.asarray(face_pil), cv2.COLOR_BGR2RGB)
+            faces = self.app.get(image)
+
+            if len(faces) == 0:
+                raise ValueError("No face detected in the input image")
+
+            # Get InsightFace embedding
+            face_embedding = torch.from_numpy(faces[0].normed_embedding)
+            ref_images_embeds = face_embedding.unsqueeze(0).unsqueeze(0).unsqueeze(0)
+
+            # Build id_embeds with DCG batching
+            dtype = self.unet.dtype if hasattr(self.unet, 'dtype') else torch.float16
+            neg_ref_images_embeds = torch.zeros_like(ref_images_embeds)
+
+            if dcg_type == 4:
+                id_embeds = torch.cat([
+                    neg_ref_images_embeds,  # uncond
+                    ref_images_embeds,      # face_only
+                    ref_images_embeds,      # style_only (placeholder)
+                    ref_images_embeds,      # combined
+                ], dim=0).to(dtype=dtype, device=self.device)
+            else:
+                id_embeds = torch.cat([
+                    neg_ref_images_embeds,
+                    ref_images_embeds,
+                    ref_images_embeds,
+                ], dim=0).to(dtype=dtype, device=self.device)
+
+            # Set Face CLIP embedding for FaceID adapter (first adapter)
+            face_crop = face_align.norm_crop(image, landmark=faces[0].kps, image_size=224)
+            face_crop_pil = Image.fromarray(cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB))
+            face_clip_embeds, neg_face_clip_embeds = self.encode_image(
+                face_crop_pil, torch.device(self.device), 1, output_hidden_states=True
+            )
+            # ImageProjection expects 4D: [batch, num_images, seq_len, hidden_dim]
+            face_clip_embeds = face_clip_embeds.unsqueeze(1)  # [1, 1, 257, 1280]
+            neg_face_clip_embeds = neg_face_clip_embeds.unsqueeze(1)  # [1, 1, 257, 1280]
+            if dcg_type == 4:
+                face_clip_batched = torch.cat([
+                    neg_face_clip_embeds, face_clip_embeds, face_clip_embeds, face_clip_embeds
+                ], dim=0)  # [4, 1, 257, 1280]
+            else:
+                face_clip_batched = torch.cat([
+                    neg_face_clip_embeds, face_clip_embeds, face_clip_embeds
+                ], dim=0)  # [3, 1, 257, 1280]
+            self.unet.encoder_hid_proj.image_projection_layers[0].clip_embeds = face_clip_batched.to(dtype=dtype)
+            self.unet.encoder_hid_proj.image_projection_layers[0].shortcut = True
+
+            # 2. Load style image for the Style adapter
+            if isinstance(style_image, str):
+                style_pil = Image.open(style_image).convert("RGB")
+            else:
+                style_pil = style_image
+
+            # 3. Set adapter scales: [FaceID, Style]
+            # style_strength directly controls the Style adapter's influence
+            face_scale = self._config.get("ip_adapter_scale", 0.5)
+            style_scale = style_strength  # Direct control
+            self.set_ip_adapter_scale([face_scale, style_scale])
+
+            print(f">>> [DEBUG] Dual IP-Adapter Mode (True Separation)")
+            print(f">>> [DEBUG] FaceID scale: {face_scale}, Style scale: {style_scale}")
             print(f">>> [DEBUG] id_embeds shape: {id_embeds.shape}")
 
-        # Prepare style latents for img2img approach
-        init_latents = None
-        if style_image is not None:
-            height = pipe_kwargs.get("height", 1024)
-            width = pipe_kwargs.get("width", 1024)
-            init_latents = self._prepare_style_latents(
-                style_image, height, width, generator, torch.float16
+            # Create step callback for progress reporting
+            total_steps = pipe_kwargs.get("num_inference_steps", 4)
+            def step_callback(step_idx, t, latents):
+                if progress_callback:
+                    progress_callback(step_idx + 1, total_steps)
+
+            # 4. Encode style image for the Style adapter
+            # The Style adapter (IP-Adapter Plus) expects CLIP embeddings
+            style_embeds = self._encode_style_for_adapter(style_pil, dcg_type)
+            print(f">>> [DEBUG] style_embeds shape: {style_embeds.shape}")
+
+            # 5. Generate with both adapters
+            # ip_adapter_image_embeds: [FaceID embeds, Style embeds]
+            # Each adapter processes its own embeddings independently
+            res = self(
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                ip_adapter_image_embeds=[id_embeds, style_embeds],
+                num_images_per_prompt=1,
+                generator=generator,
+                # NO init_latents - pure txt2img to prevent structure bleeding
+                callback=step_callback,
+                callback_steps=1,
+                **pipe_kwargs
+            ).images[0]
+
+        elif dual_adapter_mode and style_image is not None:
+            # Fallback: dual_adapter_mode requested but pipeline doesn't have dual adapters
+            # Use original CLIP blending approach
+            print(">>> [WARNING] Dual adapter mode requested but pipeline loaded without dual adapters")
+            print(">>> [WARNING] Falling back to CLIP blending mode")
+
+            id_embeds, face_clip_embeds = get_faceid_embeds(
+                self, self.app, face_image, "plus-v2",
+                do_cfg=True, decoupled=True, dcg_type=dcg_type
             )
-            print(f">>> [DEBUG] style_latents shape: {init_latents.shape}, strength: {style_strength}")
+            if id_embeds is None:
+                raise ValueError("No face detected in the input image")
 
-        # Invert style_strength to denoising_strength:
-        # High style_strength = preserve more style = lower denoising
-        # Low style_strength = change more = higher denoising
-        denoising = 1.0 - style_strength if init_latents is not None else 1.0
+            style_clip_embeds = self._get_style_clip_embeds(style_image, dcg_type=dcg_type)
+            blended_clip = (1 - style_strength) * face_clip_embeds + style_strength * style_clip_embeds
+            dtype = self.unet.dtype if hasattr(self.unet, 'dtype') else torch.float16
+            self.unet.encoder_hid_proj.image_projection_layers[0].clip_embeds = blended_clip.to(dtype=dtype)
 
-        res = self(
-            prompt=prompt,
-            ip_adapter_image_embeds=[id_embeds],
-            num_images_per_prompt=1,
-            generator=generator,
-            init_latents=init_latents,
-            denoising_strength=denoising,
-            **pipe_kwargs
-        ).images[0]
+            total_steps = pipe_kwargs.get("num_inference_steps", 4)
+            def step_callback(step_idx, t, latents):
+                if progress_callback:
+                    progress_callback(step_idx + 1, total_steps)
+
+            res = self(
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                ip_adapter_image_embeds=[id_embeds],
+                num_images_per_prompt=1,
+                generator=generator,
+                callback=step_callback,
+                callback_steps=1,
+                **pipe_kwargs
+            ).images[0]
+
+        else:
+            # Original mode: single adapter or img2img style transfer
+            id_embeds, _ = get_faceid_embeds(
+                self,
+                self.app,
+                face_image,
+                "plus-v2",
+                do_cfg=True,
+                decoupled=True,
+                dcg_type=dcg_type
+            )
+
+            print(f">>> [DEBUG] face_image: {face_image}")
+            print(f">>> [DEBUG] id_embeds is None: {id_embeds is None}")
+            if id_embeds is not None:
+                print(f">>> [DEBUG] id_embeds shape: {id_embeds.shape}")
+
+            # Prepare style latents for img2img approach
+            init_latents = None
+            if style_image is not None:
+                height = pipe_kwargs.get("height", 1024)
+                width = pipe_kwargs.get("width", 1024)
+                # Use VAE's dtype for consistency (float32 on MPS, float16 on CUDA)
+                vae_dtype = self.vae.dtype if hasattr(self.vae, 'dtype') else torch.float16
+                init_latents = self._prepare_style_latents(
+                    style_image, height, width, generator, vae_dtype
+                )
+                print(f">>> [DEBUG] style_latents shape: {init_latents.shape}, strength: {style_strength}")
+
+            # Invert style_strength to denoising_strength:
+            # High style_strength = preserve more style = lower denoising
+            # Low style_strength = change more = higher denoising
+            denoising = 1.0 - style_strength if init_latents is not None else 1.0
+
+            # Create step callback for progress reporting
+            total_steps = pipe_kwargs.get("num_inference_steps", 4)
+            def step_callback(step_idx, t, latents):
+                if progress_callback:
+                    progress_callback(step_idx + 1, total_steps)
+
+            res = self(
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                ip_adapter_image_embeds=[id_embeds],
+                num_images_per_prompt=1,
+                generator=generator,
+                init_latents=init_latents,
+                denoising_strength=denoising,
+                callback=step_callback,
+                callback_steps=1,
+                **pipe_kwargs
+            ).images[0]
 
         if after_hook_fn is not None:
             after_hook_fn(self, res)
 
         return res
+
+    def _encode_style_for_adapter(self, style_image, dcg_type=3):
+        """Encode style image for the Style IP-Adapter (second adapter).
+
+        This method encodes the style image using the CLIP encoder and formats
+        the embeddings for use with the standard IP-Adapter Plus.
+
+        Args:
+            style_image: PIL Image for style reference
+            dcg_type: DCG type for batch configuration
+
+        Returns:
+            Style embeddings formatted for the IP-Adapter
+        """
+        from PIL import Image
+
+        # Resize to CLIP input size
+        clip_image_size = self.image_encoder.config.image_size
+        style_resized = style_image.resize((clip_image_size, clip_image_size), Image.LANCZOS)
+
+        # Encode through CLIP
+        image_embeds, negative_image_embeds = self.encode_image(
+            style_resized,
+            torch.device(self.device),
+            1,  # num_images_per_prompt
+            output_hidden_states=True  # IP-Adapter Plus uses hidden states
+        )
+        # encode_image returns [1, 257, 1280] (3D)
+        # IP-Adapter Plus expects 4D: [batch, num_images, seq_len, embed_dim]
+        # Add num_images dimension
+        image_embeds = image_embeds.unsqueeze(1)  # [1, 1, 257, 1280]
+        negative_image_embeds = negative_image_embeds.unsqueeze(1)  # [1, 1, 257, 1280]
+
+        # Format for DCG batching (match FaceID embedding batch structure)
+        # For DCG type 3: [uncond, cond, cond] -> [3, 1, 257, 1280]
+        # For DCG type 4: [uncond, cond, cond, cond] -> [4, 1, 257, 1280]
+        if dcg_type == 4:
+            style_embeds = torch.cat([
+                negative_image_embeds,  # uncond
+                image_embeds,           # face_only batch (not used but needed for shape)
+                image_embeds,           # style_only batch
+                image_embeds,           # combined batch
+            ], dim=0)  # [4, 1, 257, 1280]
+        else:
+            # DCG type 3
+            style_embeds = torch.cat([
+                negative_image_embeds,  # uncond
+                image_embeds,           # intermediate
+                image_embeds,           # final
+            ], dim=0)  # [3, 1, 257, 1280]
+
+        dtype = self.unet.dtype if hasattr(self.unet, 'dtype') else torch.float16
+        return style_embeds.to(dtype=dtype)
+
+    def _get_style_clip_embeds(self, style_image, dcg_type=3, dtype=None):
+        """Extract CLIP embeddings from style image for IP-Adapter.
+
+        Returns embeddings in the same format as face CLIP embeddings
+        so they can be blended together.
+        """
+        from PIL import Image
+
+        if isinstance(style_image, str):
+            style_image = Image.open(style_image).convert("RGB")
+
+        # Resize to 224x224 for CLIP (same as face alignment size)
+        style_image_resized = style_image.resize((224, 224), Image.LANCZOS)
+
+        # Get CLIP embeddings using the pipeline's prepare method
+        # Must use same dcg_type as face CLIP to ensure matching shapes
+        clip_embeds = self.prepare_ip_adapter_image_embeds(
+            [[style_image_resized]],
+            None,
+            torch.device(self.device),
+            1,  # batch_size
+            True,  # do_cfg
+            do_decoupled_cfg=True,
+            dcg_type=dcg_type
+        )[0]
+
+        # Use UNet's dtype if not specified (float32 on MPS, float16 on CUDA)
+        if dtype is None:
+            dtype = self.unet.dtype if hasattr(self.unet, 'dtype') else torch.float16
+        return clip_embeds.to(dtype=dtype)
+
+    def _get_style_clip_embeds_simple(self, style_image, dcg_type, dtype=None):
+        """Extract CLIP embeddings from style image matching the face CLIP format"""
+        from PIL import Image
+
+        if isinstance(style_image, str):
+            style_image = Image.open(style_image).convert("RGB")
+
+        # Resize to 224x224 for CLIP
+        style_image_resized = style_image.resize((224, 224), Image.LANCZOS)
+
+        # Get CLIP embeddings using the same method as face CLIP
+        clip_embeds = self.prepare_ip_adapter_image_embeds(
+            [[style_image_resized]],
+            None,
+            torch.device(self.device),
+            1,  # batch_size
+            True,  # do_cfg
+            do_decoupled_cfg=True,
+            dcg_type=dcg_type
+        )[0]
+
+        # Use UNet's dtype if not specified (float32 on MPS, float16 on CUDA)
+        if dtype is None:
+            dtype = self.unet.dtype if hasattr(self.unet, 'dtype') else torch.float16
+        return clip_embeds.to(dtype=dtype)
+
+    def _get_raw_style_clip_embeds(self, style_image, dtype=None):
+        """Extract raw CLIP embeddings from style image for batch-wise stacking.
+
+        Returns a single embedding (no batch expansion) that matches the shape
+        of face_id_embeds so they can be concatenated in the batch dimension.
+        """
+        from PIL import Image
+
+        if isinstance(style_image, str):
+            style_image = Image.open(style_image).convert("RGB")
+
+        # Resize to CLIP input size
+        clip_image_size = self.image_encoder.config.image_size
+        style_image_resized = style_image.resize((clip_image_size, clip_image_size), Image.LANCZOS)
+
+        # Use the pipeline's encode_image method directly
+        # This returns (image_embeds, negative_image_embeds)
+        image_embeds, _ = self.encode_image(
+            style_image_resized,
+            torch.device(self.device),
+            1,  # num_images_per_prompt
+            output_hidden_states=False  # ImageProjection expects final hidden state
+        )
+
+        # image_embeds shape: [1, num_tokens, embed_dim]
+        # Use UNet's dtype if not specified
+        if dtype is None:
+            dtype = self.unet.dtype if hasattr(self.unet, 'dtype') else torch.float16
+
+        return image_embeds.to(dtype=dtype)
 
     def _prepare_style_latents(self, style_image, height, width, generator, dtype):
         """Encode style image to latents for img2img style transfer"""
@@ -193,16 +591,27 @@ class DecoupledGuidancePipelineXL(StableDiffusionXLPipeline):
 
         # Convert to tensor: [0, 255] -> [-1, 1]
         style_tensor = TF.to_tensor(style_image).unsqueeze(0)  # [1, 3, H, W]
-        style_tensor = (style_tensor * 2.0 - 1.0).to(self.device, dtype=dtype)
+        # Always use float32 for VAE encoding to prevent overflow/NaN
+        style_tensor = (style_tensor * 2.0 - 1.0).to(self.device, dtype=torch.float32)
 
-        # Encode with VAE
+        # Encode with VAE (upcast VAE to float32 if needed to prevent overflow)
         with torch.no_grad():
+            # Check if VAE needs upcasting (common with SDXL VAE in float16)
+            needs_upcast = self.vae.dtype == torch.float16
+            if needs_upcast:
+                self.vae.to(dtype=torch.float32)
+
             encoded = self.vae.encode(style_tensor)
             if hasattr(encoded, 'latent_dist'):
                 init_latents = encoded.latent_dist.sample(generator)
             else:
                 init_latents = encoded.latents
             init_latents = init_latents * self.vae.config.scaling_factor
+
+            # Restore VAE dtype and convert latents to target dtype
+            if needs_upcast:
+                self.vae.to(dtype=torch.float16)
+            init_latents = init_latents.to(dtype=dtype)
 
         return init_latents
 
@@ -252,6 +661,9 @@ class DecoupledGuidancePipelineXL(StableDiffusionXLPipeline):
     ):
         callback = kwargs.pop("callback", None)
         callback_steps = kwargs.pop("callback_steps", None)
+        # Pop dual adapter mode params (handled in execute method)
+        kwargs.pop("dual_adapter_mode", None)
+        kwargs.pop("style_strength", None)
 
         # 0. Default height and width to unet
         height = height or self.default_sample_size * self.vae_scale_factor
@@ -464,8 +876,12 @@ class DecoupledGuidancePipelineXL(StableDiffusionXLPipeline):
                     continue
 
                 # expand the latents if we are doing classifier free guidance
-                # NOTE: expanding to 3 to enable decoupled guidance
-                latent_model_input = torch.cat([latents] * 3) if self.do_classifier_free_guidance else latents
+                # NOTE: expanding to 3 or 4 to enable decoupled guidance
+                if self.do_classifier_free_guidance:
+                    num_batches = 4 if dcg_type == 4 else 3
+                    latent_model_input = torch.cat([latents] * num_batches)
+                else:
+                    latent_model_input = latents
 
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
@@ -664,31 +1080,49 @@ def prepare_dcg_pipeline(config, device, *args, **kwargs):
         pipe.scheduler = LCMScheduler.from_config(pipe.scheduler.config)
     elif model_name == "lightning":
         if n_steps not in [2, 4, 8]:
-            raise ValueError(f"n_steps={n_steps} not supported for ligntning checkpoint")
-        unet = UNet2DConditionModel.from_config(
-            "stabilityai/stable-diffusion-xl-base-1.0", 
-            subfolder="unet",
-            cache_dir="models_cache/sdxl").to(device, torch.float16)
-        
-        unet.load_state_dict(load_file(
-            hf_hub_download(
-                "ByteDance/SDXL-Lightning", 
-                f"sdxl_lightning_{n_steps}step_unet.safetensors",
-                cache_dir=f"models_cache/sdxl-lightning-{n_steps}"), 
-                device="cpu"
+            raise ValueError(f"n_steps={n_steps} not supported for lightning checkpoint")
+
+        # Cache full pipeline with loaded UNet for faster subsequent loads
+        lightning_cache_path = f"models_cache/lightning-{n_steps}-pipe"
+
+        if not os.path.exists(lightning_cache_path):
+            unet = UNet2DConditionModel.from_config(
+                "stabilityai/stable-diffusion-xl-base-1.0",
+                subfolder="unet",
+                cache_dir="models_cache/sdxl").to(device, torch.float16)
+
+            unet.load_state_dict(load_file(
+                hf_hub_download(
+                    "ByteDance/SDXL-Lightning",
+                    f"sdxl_lightning_{n_steps}step_unet.safetensors",
+                    cache_dir=f"models_cache/sdxl-lightning-{n_steps}"),
+                    device="cpu"
+                )
             )
-        )
+            # Create base pipeline with lightning UNet
+            base_pipe = StableDiffusionXLPipeline.from_pretrained(
+                "stabilityai/stable-diffusion-xl-base-1.0",
+                unet=unet,
+                torch_dtype=torch.float16,
+                cache_dir="models_cache/sdxl",
+                variant="fp16",
+            ).to(device)
+            base_pipe.scheduler = EulerDiscreteScheduler.from_config(
+                base_pipe.scheduler.config,
+                timestep_spacing="trailing"
+            )
+            # Save for later use
+            base_pipe.save_pretrained(lightning_cache_path)
+
+        # Load cached pipeline
         pipe = method2pipeline[adaptation_method].from_pretrained(
-            "stabilityai/stable-diffusion-xl-base-1.0", 
-            unet=unet, 
+            lightning_cache_path,
             torch_dtype=torch.float16,
-            cache_dir="models_cache/sdxl",
-            variant="fp16",
             *args,
             **kwargs
         ).to(device)
         pipe.scheduler = EulerDiscreteScheduler.from_config(
-            pipe.scheduler.config, 
+            pipe.scheduler.config,
             timestep_spacing="trailing"
         )
     elif model_name == "turbo":
@@ -698,7 +1132,7 @@ def prepare_dcg_pipeline(config, device, *args, **kwargs):
             torch_dtype=torch.float16,
             subfolder="unet",
             cache_dir="models_cache/sdxl-turbo"
-        ).to(device)    
+        ).to(device)
         pipe = method2pipeline[adaptation_method].from_pretrained(
             "stabilityai/stable-diffusion-xl-base-1.0",
             torch_dtype=torch.float16,
@@ -708,13 +1142,50 @@ def prepare_dcg_pipeline(config, device, *args, **kwargs):
             **kwargs
         ).to(device)
         pipe.scheduler = scheduler
-    
+    elif model_name == "realvis":
+        # RealVisXL V4.0 - Photorealistic model with excellent skin texture
+        if n_steps not in [1, 2, 4, 8]:
+            raise ValueError(f"num_inference_steps={n_steps} not supported for realvis checkpoint")
+
+        # Load RealVisXL as base, then apply Hyper-SD LoRA for speed
+        if not os.path.exists(f"models_cache/realvis-hyper-{n_steps}-fused"):
+            pipe = StableDiffusionXLPipeline.from_pretrained(
+                "SG161222/RealVisXL_V4.0",
+                torch_dtype=torch.float16,
+                cache_dir="models_cache/realvis"
+            ).to(device)
+            # Apply Hyper-SD LoRA for few-step generation
+            pipe.load_lora_weights(hf_hub_download(
+                "ByteDance/Hyper-SD",
+                f"Hyper-SDXL-{n_steps}step{'s' if n_steps > 1 else ''}-lora.safetensors",
+                cache_dir=f"models_cache/sdxl-hyper-{n_steps}")
+            )
+            pipe.fuse_lora()
+            pipe.unload_lora_weights()
+            pipe.save_pretrained(f"models_cache/realvis-hyper-{n_steps}-fused")
+
+        pipe = method2pipeline[adaptation_method].from_pretrained(
+            f"models_cache/realvis-hyper-{n_steps}-fused",
+            torch_dtype=torch.float16,
+            cache_dir="models_cache/realvis",
+            *args,
+            **kwargs,
+        ).to(device)
+        pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config, timestep_spacing="trailing")
+
     return pipe
 
 
-def get_faceid_pipeline(config, device):
+def get_faceid_pipeline(config, device, dual_adapter=True):
+    """Load FaceID pipeline with optional dual IP-Adapter support.
+
+    Args:
+        config: Pipeline configuration
+        device: Torch device
+        dual_adapter: If True, load both FaceID and Style IP-Adapters
+    """
     os.makedirs("models_cache", exist_ok=True)
-    
+
     pipe = prepare_dcg_pipeline(config, device)
     ip_adapter_scale = config.get("ip_adapter_scale", 0.5)
 
@@ -731,16 +1202,38 @@ def get_faceid_pipeline(config, device):
         feature_extractor = CLIPImageProcessor(size=clip_image_size, crop_size=clip_image_size)
         pipe.register_modules(feature_extractor=feature_extractor)
 
-        pipe.load_ip_adapter(
-            "h94/IP-Adapter-FaceID", 
-            subfolder=None, 
-            weight_name="ip-adapter-faceid-plusv2_sdxl.bin", 
-            image_encoder_folder=None,
-            cache_dir="models_cache/ipadapter"
-        )
-        
-        pipe.set_ip_adapter_scale(ip_adapter_scale)
-        pipe.track_norms=False
+        if dual_adapter:
+            # Load BOTH IP-Adapters: FaceID (for identity) + Standard (for style)
+            # This allows completely separate control of face and style
+            print(">>> Loading Dual IP-Adapters (FaceID + Style)...")
+            pipe.load_ip_adapter(
+                ["h94/IP-Adapter-FaceID", "h94/IP-Adapter"],
+                subfolder=[None, "sdxl_models"],
+                weight_name=[
+                    "ip-adapter-faceid-plusv2_sdxl.bin",
+                    "ip-adapter-plus_sdxl_vit-h.safetensors"
+                ],
+                image_encoder_folder=None,
+                cache_dir="models_cache/ipadapter"
+            )
+            # Set scales: [FaceID scale, Style scale]
+            # Style scale will be dynamically adjusted based on style_strength
+            pipe.set_ip_adapter_scale([ip_adapter_scale, 0.0])
+            pipe.dual_adapter_enabled = True
+            print(">>> Dual IP-Adapters loaded successfully")
+        else:
+            # Single adapter mode (FaceID only)
+            pipe.load_ip_adapter(
+                "h94/IP-Adapter-FaceID",
+                subfolder=None,
+                weight_name="ip-adapter-faceid-plusv2_sdxl.bin",
+                image_encoder_folder=None,
+                cache_dir="models_cache/ipadapter"
+            )
+            pipe.set_ip_adapter_scale(ip_adapter_scale)
+            pipe.dual_adapter_enabled = False
+
+        pipe.track_norms = False
 
     # Set up FaceAnalysis providers based on device type
     if torch.cuda.is_available() and 'cuda' in str(device):

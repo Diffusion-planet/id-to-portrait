@@ -8,7 +8,7 @@
         "width": 1024,
         "height": 1024,
         "dcg_kwargs": {
-            "dcg_type": 3,
+            "dcg_type": 4,
             "term_preproc": "",
             "term_postproc": "rescale",
             "rescale": 0.75,
@@ -16,8 +16,8 @@
             "b_scheduler": "custom",
             "sch_kwargs": {
                 "custom": {
-                    "a": [1.0, 1.5, 1.2, 0.5],
-                    "b": [1.0, 2.5, 2.0, 0.5]
+                    "a": [1.5, 1.5, 1.0, 0.5],
+                    "b": [0.5, 1.2, 1.5, 0.3]
                 }
             },
             "return_norms": false
@@ -30,7 +30,7 @@
     "am_patch_kwargs": {
         "target_parts": ["down", "up"],
         "target_tokens": [0, 1, 2, 3],
-        "target_tsteps": [0, 1, 2],
+        "target_tsteps": [0, 1],
         "am_transforms": ["pow", "scale"],
         "inverse_neg_transforms": false,
         "apply_schedule": false,

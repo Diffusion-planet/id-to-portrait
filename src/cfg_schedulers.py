@@ -13,7 +13,9 @@ class CustomScheduler:
         self.w_values = w_values
 
     def __call__(self, w, i, *args, **kwargs):
-        return self.w_values[i] # i - index of timestep (!!!)
+        # Clamp index to valid range for variable step counts
+        idx = min(i, len(self.w_values) - 1)
+        return self.w_values[idx]
 
 
 def default_scheduler(w, t, *args, **kwargs):
