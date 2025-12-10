@@ -11,7 +11,8 @@ FastFace 논문 구현체의 버전별 개발 히스토리와 기술적 변경�
 | v0 | c89e4a8 | 2025-05-28 | 논문 원본 구현 (CUDA only) |
 | v1 | f40ba93 | 2025-12-05 | Mac MPS 지원, Web UI, Style Image Transfer |
 | v2 | (uncommitted) | 2025-12-08 | RealVisXL 모델, 비동기 Task 시스템, Dual Adapter Mode 개선, VLM 프롬프트 생성 |
-| v3 | (uncommitted) | 2025-12-08 | Batch-Wise Decoupled Embedding, img2img 제거, Face ID 보존 강화 |
+| v3 | e9eef5e | 2025-12-08 | Batch-Wise Decoupled Embedding, img2img 제거, Face ID 보존 강화 |
+| v4 | (current) | 2025-12-11 | CLIP Blending으로 Identity Loss 문제 해결 |
 
 ---
 
@@ -899,6 +900,155 @@ res = pipe.execute(
 **style_strength 의미:**
 - v3에서는 Style IP-Adapter의 scale을 직접 제어
 - 0.0 ~ 1.0 권장 (너무 높으면 스타일이 과도하게 적용)
+
+---
+
+## v4: CLIP Blending (Identity Loss Fix)
+
+### Status: In Development (2025-12-11)
+
+v3의 Dual IP-Adapter 방식에서 발생한 **Identity Loss 문제**를 해결하기 위해 CLIP Embedding Blending 방식으로 전환했습니다.
+
+### 1. 문제 분석
+
+#### v3의 문제점
+
+스타일 이미지에 인물이 없는 경우 (배경만 있는 이미지), 생성된 이미지에서도 인물이 사라지는 현상이 발생했습니다.
+
+**원인:**
+
+1. **CLIP은 Semantic 정보를 인코딩**
+   - CLIP ViT는 이미지-텍스트 정렬을 위해 학습됨
+   - "스타일"만 추출하는 것이 아니라 **전체 의미 정보** 인코딩
+   - 객체 존재 여부 ("인물 있음/없음")가 강하게 인코딩됨
+
+2. **토큰 수 불균형**
+
+   | Adapter | 토큰 수 | 정보량 |
+   |---------|---------|--------|
+   | FaceID Plus v2 | 4 (projected) | 얼굴 특징만 |
+   | IP-Adapter Plus (Style) | 257 | 전체 이미지 의미 |
+
+3. **Cross-Attention 충돌**
+
+   ```python
+   # FaceID: "이 얼굴을 생성해라"
+   # Style: "이 장면에는 인물이 없다"
+   # → Style의 257개 토큰이 FaceID의 4개 토큰을 압도
+   ```
+
+자세한 분석은 [GitHub Issue #1](https://github.com/danlee-dev/prometheus-fastface-dev/issues/1) 참조.
+
+### 2. 해결책: CLIP Embedding Blending
+
+Dual Adapter 대신 **단일 FaceID Adapter**를 사용하되, **Face CLIP과 Style CLIP을 블렌딩**합니다.
+
+#### 핵심 공식
+
+```python
+blended_clip = (1 - alpha) * face_clip + alpha * style_clip
+```
+
+#### 원리
+
+```python
+# Face CLIP embedding (개념적 분해)
+face_clip = [
+    person_presence: 0.9,      # "인물이 있음" - 강하게 인코딩
+    face_features: [0.8, ...],
+    skin_tone: 0.6,
+    lighting: 0.5,
+    ...
+]
+
+# Style CLIP embedding (배경만 있는 이미지)
+style_clip = [
+    person_presence: 0.1,      # "인물이 없음" - 문제의 원인!
+    face_features: [0.0, ...],
+    lighting: 0.8,             # 조명 정보
+    background: 0.9,           # 배경 정보
+    ...
+]
+
+# Blending (alpha = 0.3)
+blended = [
+    person_presence: 0.7 * 0.9 + 0.3 * 0.1 = 0.66,  # 인물 정보 유지!
+    face_features: [0.56, ...],
+    lighting: 0.35 + 0.24 = 0.59,                    # 스타일 조명 혼합
+    background: 0.21 + 0.27 = 0.48,                  # 스타일 배경 혼합
+    ...
+]
+```
+
+**핵심:** `person_presence`가 0.66으로 유지되어 UNet이 "인물이 있다"고 판단
+
+### 3. 구현 변경사항
+
+#### execute() 메서드 수정
+
+**변경 전 (v3):**
+
+```python
+# 두 개의 독립적인 adapter 사용
+ip_adapter_image_embeds = [id_embeds, style_embeds]
+self.set_ip_adapter_scale([face_scale, style_scale])
+```
+
+**변경 후 (v4):**
+
+```python
+# Face CLIP + Style CLIP 블렌딩
+blended_clip = (1 - style_strength) * face_clip_embeds + style_strength * style_clip_embeds
+self.unet.encoder_hid_proj.image_projection_layers[0].clip_embeds = blended_clip
+
+# Style adapter 비활성화 (scale=0)
+if dual_adapter_enabled:
+    self.set_ip_adapter_scale([face_scale, 0.0])
+    ip_adapter_embeds = [id_embeds, dummy_style_embeds]
+else:
+    ip_adapter_embeds = [id_embeds]
+```
+
+#### 로그 출력
+
+```
+>>> [CLIP Blending Mode] style_strength=0.3
+>>> [DEBUG] face_clip_embeds shape: torch.Size([3, 257, 1280])
+>>> [DEBUG] style_clip_embeds shape: torch.Size([3, 257, 1280])
+>>> [DEBUG] blended_clip shape: torch.Size([3, 257, 1280])
+>>> [DEBUG] Blend ratio - Face: 70.0%, Style: 30.0%
+>>> [DEBUG] Dual adapter loaded but Style adapter disabled (scale=0)
+```
+
+### 4. v3 vs v4 비교
+
+| 항목 | v3 (Dual Adapter) | v4 (CLIP Blending) |
+|------|-------------------|-------------------|
+| IP-Adapter 수 | 2개 (FaceID + Style) | 1개 (FaceID만 활성) |
+| Style 적용 방식 | 별도 adapter | CLIP embedding 블렌딩 |
+| Identity 보존 | 낮음 (Style이 override) | 높음 (Face CLIP 유지) |
+| 스타일 분리 | 이론상 완전 분리 | 부분적 분리 |
+| 배경만 있는 스타일 | 인물 사라짐 | 인물 유지됨 |
+
+### 5. style_strength 의미 변화
+
+| Version | style_strength 의미 |
+|---------|---------------------|
+| v2 | CLIP blending 비율 (동일) |
+| v3 | Style adapter scale (0.0~1.0) |
+| v4 | CLIP blending 비율 (v2와 동일하게 복원) |
+
+### 6. 한계점 및 향후 개선
+
+**현재 한계:**
+
+- CLIP embedding 자체가 의미 정보를 포함하므로 완벽한 스타일 분리 불가
+- 블렌딩 비율에 따라 스타일 효과가 약해질 수 있음
+
+**향후 개선 (v5 예정):**
+
+- ControlNet 통합으로 구조적 제약 추가
+- 인물 구조를 강제하면서 스타일만 변경 가능
 
 ---
 

@@ -230,27 +230,41 @@ class DecoupledGuidancePipelineXL(StableDiffusionXLPipeline):
 
         dcg_type = pipe_kwargs["dcg_kwargs"]["dcg_type"]
 
-        # Dual Adapter Mode v3: True Dual IP-Adapter Architecture
+        # Style Transfer Mode v4: CLIP Blending
         #
-        # Uses TWO separate IP-Adapters:
-        #   1. IP-Adapter FaceID Plus v2: For face identity (InsightFace + CLIP)
-        #   2. IP-Adapter Plus: For style transfer (general CLIP)
+        # Previous v3 approach (Dual IP-Adapter) had a critical issue:
+        # - Style adapter's CLIP embedding contains full semantic info
+        # - When style image has no person, "no person" signal overrides FaceID
+        # - Result: Generated image loses the person entirely
         #
-        # Each adapter processes its own input independently:
-        #   - FaceID adapter: face_image → InsightFace embedding → face identity
-        #   - Style adapter: style_image → CLIP embedding → visual style
+        # v4 Solution: CLIP Embedding Blending
+        # - Blend face_clip and style_clip: (1-α)*face + α*style
+        # - face_clip always contains "person exists" information
+        # - Blending preserves person while transferring style attributes
         #
-        # This provides TRUE separation of face identity and style.
-        # No blending, no cross-contamination.
+        # See GitHub Issue #1 for detailed analysis.
 
-        if dual_adapter_mode and style_image is not None and getattr(self, 'dual_adapter_enabled', False):
+        if dual_adapter_mode and style_image is not None:
+            # ============================================================
+            # CLIP Blending Mode (v4)
+            # ============================================================
+            # Problem: Dual IP-Adapter approach causes identity loss when
+            # style image has no person (CLIP encodes "no person" semantic)
+            #
+            # Solution: Blend face_clip and style_clip embeddings
+            # - face_clip contains "person_presence" information
+            # - Blending preserves person information while adding style
+            #
+            # Formula: blended = (1 - α) * face_clip + α * style_clip
+            # ============================================================
             from PIL import Image
             import cv2
             import numpy as np
             from insightface.utils import face_align
 
-            # 1. Extract Face ID embedding directly (avoid prepare_ip_adapter_image_embeds)
-            # This is needed because dual adapters expect 2 images, but we only have face image here
+            print(f">>> [CLIP Blending Mode] style_strength={style_strength}")
+
+            # 1. Extract Face ID embedding directly (bypass prepare_ip_adapter_image_embeds)
             if isinstance(face_image, str):
                 face_pil = Image.open(face_image)
             else:
@@ -271,10 +285,10 @@ class DecoupledGuidancePipelineXL(StableDiffusionXLPipeline):
 
             if dcg_type == 4:
                 id_embeds = torch.cat([
-                    neg_ref_images_embeds,  # uncond
-                    ref_images_embeds,      # face_only
-                    ref_images_embeds,      # style_only (placeholder)
-                    ref_images_embeds,      # combined
+                    neg_ref_images_embeds,
+                    ref_images_embeds,
+                    ref_images_embeds,
+                    ref_images_embeds,
                 ], dim=0).to(dtype=dtype, device=self.device)
             else:
                 id_embeds = torch.cat([
@@ -283,95 +297,80 @@ class DecoupledGuidancePipelineXL(StableDiffusionXLPipeline):
                     ref_images_embeds,
                 ], dim=0).to(dtype=dtype, device=self.device)
 
-            # Set Face CLIP embedding for FaceID adapter (first adapter)
+            # 2. Extract Face CLIP embedding
             face_crop = face_align.norm_crop(image, landmark=faces[0].kps, image_size=224)
             face_crop_pil = Image.fromarray(cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB))
             face_clip_embeds, neg_face_clip_embeds = self.encode_image(
                 face_crop_pil, torch.device(self.device), 1, output_hidden_states=True
             )
-            # ImageProjection expects 4D: [batch, num_images, seq_len, hidden_dim]
-            face_clip_embeds = face_clip_embeds.unsqueeze(1)  # [1, 1, 257, 1280]
-            neg_face_clip_embeds = neg_face_clip_embeds.unsqueeze(1)  # [1, 1, 257, 1280]
-            if dcg_type == 4:
-                face_clip_batched = torch.cat([
-                    neg_face_clip_embeds, face_clip_embeds, face_clip_embeds, face_clip_embeds
-                ], dim=0)  # [4, 1, 257, 1280]
-            else:
-                face_clip_batched = torch.cat([
-                    neg_face_clip_embeds, face_clip_embeds, face_clip_embeds
-                ], dim=0)  # [3, 1, 257, 1280]
-            self.unet.encoder_hid_proj.image_projection_layers[0].clip_embeds = face_clip_batched.to(dtype=dtype)
-            self.unet.encoder_hid_proj.image_projection_layers[0].shortcut = True
 
-            # 2. Load style image for the Style adapter
+            # 3. Extract Style CLIP embedding
             if isinstance(style_image, str):
                 style_pil = Image.open(style_image).convert("RGB")
             else:
                 style_pil = style_image
-
-            # 3. Set adapter scales: [FaceID, Style]
-            # style_strength directly controls the Style adapter's influence
-            face_scale = self._config.get("ip_adapter_scale", 0.5)
-            style_scale = style_strength  # Direct control
-            self.set_ip_adapter_scale([face_scale, style_scale])
-
-            print(f">>> [DEBUG] Dual IP-Adapter Mode (True Separation)")
-            print(f">>> [DEBUG] FaceID scale: {face_scale}, Style scale: {style_scale}")
-            print(f">>> [DEBUG] id_embeds shape: {id_embeds.shape}")
-
-            # Create step callback for progress reporting
-            total_steps = pipe_kwargs.get("num_inference_steps", 4)
-            def step_callback(step_idx, t, latents):
-                if progress_callback:
-                    progress_callback(step_idx + 1, total_steps)
-
-            # 4. Encode style image for the Style adapter
-            # The Style adapter (IP-Adapter Plus) expects CLIP embeddings
-            style_embeds = self._encode_style_for_adapter(style_pil, dcg_type)
-            print(f">>> [DEBUG] style_embeds shape: {style_embeds.shape}")
-
-            # 5. Generate with both adapters
-            # ip_adapter_image_embeds: [FaceID embeds, Style embeds]
-            # Each adapter processes its own embeddings independently
-            res = self(
-                prompt=prompt,
-                negative_prompt=negative_prompt,
-                ip_adapter_image_embeds=[id_embeds, style_embeds],
-                num_images_per_prompt=1,
-                generator=generator,
-                # NO init_latents - pure txt2img to prevent structure bleeding
-                callback=step_callback,
-                callback_steps=1,
-                **pipe_kwargs
-            ).images[0]
-
-        elif dual_adapter_mode and style_image is not None:
-            # Fallback: dual_adapter_mode requested but pipeline doesn't have dual adapters
-            # Use original CLIP blending approach
-            print(">>> [WARNING] Dual adapter mode requested but pipeline loaded without dual adapters")
-            print(">>> [WARNING] Falling back to CLIP blending mode")
-
-            id_embeds, face_clip_embeds = get_faceid_embeds(
-                self, self.app, face_image, "plus-v2",
-                do_cfg=True, decoupled=True, dcg_type=dcg_type
+            style_resized = style_pil.resize((224, 224), Image.LANCZOS)
+            style_clip_embeds, neg_style_clip_embeds = self.encode_image(
+                style_resized, torch.device(self.device), 1, output_hidden_states=True
             )
-            if id_embeds is None:
-                raise ValueError("No face detected in the input image")
 
-            style_clip_embeds = self._get_style_clip_embeds(style_image, dcg_type=dcg_type)
-            blended_clip = (1 - style_strength) * face_clip_embeds + style_strength * style_clip_embeds
-            dtype = self.unet.dtype if hasattr(self.unet, 'dtype') else torch.float16
-            self.unet.encoder_hid_proj.image_projection_layers[0].clip_embeds = blended_clip.to(dtype=dtype)
+            # 4. Blend face and style CLIP embeddings
+            # Higher style_strength = more style influence, but face_clip's
+            # "person existence" information is always partially preserved
+            blended_pos = (1 - style_strength) * face_clip_embeds + style_strength * style_clip_embeds
+            blended_neg = (1 - style_strength) * neg_face_clip_embeds + style_strength * neg_style_clip_embeds
+
+            print(f">>> [DEBUG] face_clip_embeds shape: {face_clip_embeds.shape}")
+            print(f">>> [DEBUG] style_clip_embeds shape: {style_clip_embeds.shape}")
+            print(f">>> [DEBUG] blended_pos shape: {blended_pos.shape}")
+            print(f">>> [DEBUG] Blend ratio - Face: {1-style_strength:.1%}, Style: {style_strength:.1%}")
+
+            # 5. Build batched CLIP embedding for DCG
+            # ImageProjection expects 4D: [batch, num_images, seq_len, hidden_dim]
+            # encode_image returns 3D: [1, seq_len, hidden_dim], so add num_images dim
+            blended_pos_4d = blended_pos.unsqueeze(1)  # [1, 1, 257, 1280]
+            blended_neg_4d = blended_neg.unsqueeze(1)  # [1, 1, 257, 1280]
+
+            if dcg_type == 4:
+                blended_clip_batched = torch.cat([
+                    blended_neg_4d, blended_pos_4d, blended_pos_4d, blended_pos_4d
+                ], dim=0)  # [4, 1, 257, 1280]
+            else:
+                blended_clip_batched = torch.cat([
+                    blended_neg_4d, blended_pos_4d, blended_pos_4d
+                ], dim=0)  # [3, 1, 257, 1280]
+
+            print(f">>> [DEBUG] blended_clip_batched shape: {blended_clip_batched.shape}")
+
+            # 6. Set blended CLIP embedding to FaceID adapter
+            self.unet.encoder_hid_proj.image_projection_layers[0].clip_embeds = blended_clip_batched.to(dtype=dtype)
+            self.unet.encoder_hid_proj.image_projection_layers[0].shortcut = True
 
             total_steps = pipe_kwargs.get("num_inference_steps", 4)
             def step_callback(step_idx, t, latents):
                 if progress_callback:
                     progress_callback(step_idx + 1, total_steps)
 
+            # 7. Use only FaceID adapter (Style adapter disabled if dual adapter loaded)
+            if getattr(self, 'dual_adapter_enabled', False):
+                self.set_ip_adapter_scale([self._config.get("ip_adapter_scale", 0.5), 0.0])
+                print(f">>> [DEBUG] Dual adapter loaded but Style adapter disabled (scale=0)")
+
+                # Create dummy style embedding with correct shape for Style adapter
+                # Style adapter (IP-Adapter Plus) expects [batch, 1, 257, 1280]
+                batch_size = 4 if dcg_type == 4 else 3
+                dummy_style_embeds = torch.zeros(
+                    batch_size, 1, 257, 1280,
+                    dtype=dtype, device=self.device
+                )
+                ip_adapter_embeds = [id_embeds, dummy_style_embeds]
+            else:
+                ip_adapter_embeds = [id_embeds]
+
             res = self(
                 prompt=prompt,
                 negative_prompt=negative_prompt,
-                ip_adapter_image_embeds=[id_embeds],
+                ip_adapter_image_embeds=ip_adapter_embeds,
                 num_images_per_prompt=1,
                 generator=generator,
                 callback=step_callback,
