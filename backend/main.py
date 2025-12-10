@@ -478,6 +478,7 @@ def run_generation_task(task_id: str, params: Dict[str, Any]):
         generator = torch.Generator(device=device).manual_seed(params["seed"])
 
         log_progress("Extracting face embedding...")
+        log_progress(f"[DEBUG] dual_adapter_mode={params.get('dual_adapter_mode')}, style_image_path={style_image_path}")
 
         with torch.no_grad():
             img = pipe.execute(
@@ -488,9 +489,11 @@ def run_generation_task(task_id: str, params: Dict[str, Any]):
                 after_hook_fn=reset_patched_unet if conf["patch_pipe"] else lambda *args, **kwargs: None,
                 style_image=style_image_path,
                 style_strength=params.get("style_strength", 0.3),
+                denoising_strength=params.get("denoising_strength", 0.6),
                 dual_adapter_mode=params.get("dual_adapter_mode", False),
                 negative_prompt=params.get("negative_prompt"),
                 progress_callback=lambda step, total: log_progress(f"Generating... step {step}/{total}"),
+                ip_adapter_scale=params["ips"],
             )
 
         # Save output
@@ -519,6 +522,7 @@ def run_generation_task(task_id: str, params: Dict[str, Any]):
                 "lora_scale": params["lora_scale"],
                 "seed": params["seed"],
                 "style_strength": params.get("style_strength", 0.3),
+                "denoising_strength": params.get("denoising_strength", 0.6),
                 "inference_steps": params["inference_steps"],
                 "dual_adapter_mode": params.get("dual_adapter_mode", False),
                 "use_tiny_vae": params.get("use_tiny_vae", False),
@@ -556,6 +560,7 @@ async def generate_image(
     seed: int = Form(42),
     style_image_id: Optional[str] = Form(None),
     style_strength: float = Form(0.3),
+    denoising_strength: float = Form(0.6),
     inference_steps: int = Form(4),
     dual_adapter_mode: bool = Form(False),
     title: str = Form(""),
@@ -596,6 +601,7 @@ async def generate_image(
             "seed": seed,
             "style_image_id": style_image_id,
             "style_strength": style_strength,
+            "denoising_strength": denoising_strength,
             "inference_steps": inference_steps,
             "dual_adapter_mode": dual_adapter_mode,
             "title": title,

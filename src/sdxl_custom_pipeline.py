@@ -8,10 +8,11 @@ import torch
 from diffusers import (
     StableDiffusionXLPipeline,
     UNet2DConditionModel,
-    DDIMScheduler, 
+    DDIMScheduler,
     EulerAncestralDiscreteScheduler,
     EulerDiscreteScheduler,
-    LCMScheduler
+    LCMScheduler,
+    ControlNetModel,
 )
 from diffusers.models import ImageProjection
 from diffusers.pipelines.stable_diffusion_xl.pipeline_output import StableDiffusionXLPipelineOutput
@@ -53,7 +54,102 @@ def get_style_embeds(
 
 
 class DecoupledGuidancePipelineXL(StableDiffusionXLPipeline):
-    """pipeline to be used together with IpAdapter, adds separate image and textual guidance"""
+    """pipeline to be used together with IpAdapter, adds separate image and textual guidance.
+
+    v5 Update: Added ControlNet support for structure preservation.
+    When style transfer is enabled, depth is extracted from face image
+    and used as ControlNet conditioning to ensure face structure is preserved.
+    """
+
+    # ControlNet components (lazy loaded)
+    _controlnet = None
+    _depth_estimator = None
+
+    @property
+    def controlnet(self):
+        """Lazy load ControlNet model."""
+        return self._controlnet
+
+    @controlnet.setter
+    def controlnet(self, value):
+        self._controlnet = value
+
+    @property
+    def depth_estimator(self):
+        """Lazy load depth estimator."""
+        if self._depth_estimator is None:
+            try:
+                from controlnet_aux import MidasDetector
+                print(">>> Loading MiDaS depth estimator...")
+                self._depth_estimator = MidasDetector.from_pretrained(
+                    "lllyasviel/Annotators"
+                )
+                print(">>> MiDaS depth estimator loaded")
+            except ImportError:
+                print(">>> Warning: controlnet_aux not installed, depth estimation disabled")
+                return None
+        return self._depth_estimator
+
+    def get_depth_map(self, image, target_size=(1024, 1024)):
+        """Extract depth map from image using MiDaS.
+
+        Args:
+            image: PIL Image or path to image
+            target_size: Output size (width, height)
+
+        Returns:
+            Depth map as PIL Image, or None if depth estimation is disabled
+        """
+        from PIL import Image
+
+        if self.depth_estimator is None:
+            return None
+
+        if isinstance(image, str):
+            image = Image.open(image).convert("RGB")
+
+        # Resize to target size
+        image_resized = image.resize(target_size, Image.LANCZOS)
+
+        # Get depth map
+        depth_map = self.depth_estimator(image_resized)
+
+        return depth_map
+
+    def prepare_controlnet_image(self, image, width, height, batch_size, num_images_per_prompt, device, dtype, dcg_type=3):
+        """Prepare depth image for ControlNet conditioning.
+
+        Args:
+            image: PIL Image (depth map)
+            width, height: Target dimensions
+            batch_size: Batch size
+            num_images_per_prompt: Images per prompt
+            device: Torch device
+            dtype: Torch dtype
+            dcg_type: DCG type for batch expansion
+
+        Returns:
+            Processed image tensor for ControlNet
+        """
+        from PIL import Image
+        import torchvision.transforms.functional as TF
+
+        if isinstance(image, str):
+            image = Image.open(image).convert("RGB")
+
+        # Resize to target dimensions
+        image = image.resize((width, height), Image.LANCZOS)
+
+        # Convert to tensor: [0, 255] -> [0, 1]
+        image_tensor = TF.to_tensor(image).unsqueeze(0)  # [1, 3, H, W]
+        image_tensor = image_tensor.to(device=device, dtype=dtype)
+
+        # Expand for DCG batching (same as latents)
+        num_batches = 4 if dcg_type == 4 else 3
+        image_tensor = torch.cat([image_tensor] * num_batches, dim=0)
+
+        return image_tensor
+
     def prepare_ip_adapter_image_embeds(
         self,
         ip_adapter_image,
@@ -222,9 +318,11 @@ class DecoupledGuidancePipelineXL(StableDiffusionXLPipeline):
         after_hook_fn=None,
         style_image=None,
         style_strength=0.3,
+        denoising_strength=0.6,
         dual_adapter_mode=False,
         negative_prompt=None,
         progress_callback=None,
+        ip_adapter_scale=0.8,
     ):
         from PIL import Image
 
@@ -244,7 +342,7 @@ class DecoupledGuidancePipelineXL(StableDiffusionXLPipeline):
         #
         # See GitHub Issue #1 for detailed analysis.
 
-        if dual_adapter_mode and style_image is not None:
+        if style_image is not None:
             # ============================================================
             # CLIP Blending Mode (v4)
             # ============================================================
@@ -262,7 +360,7 @@ class DecoupledGuidancePipelineXL(StableDiffusionXLPipeline):
             import numpy as np
             from insightface.utils import face_align
 
-            print(f">>> [CLIP Blending Mode] style_strength={style_strength}")
+            print(f">>> [img2img + FaceID Mode] style_strength={style_strength}, denoising={denoising_strength}")
 
             # 1. Extract Face ID embedding directly (bypass prepare_ip_adapter_image_embeds)
             if isinstance(face_image, str):
@@ -270,6 +368,34 @@ class DecoupledGuidancePipelineXL(StableDiffusionXLPipeline):
             else:
                 face_pil = face_image
             image = cv2.cvtColor(np.asarray(face_pil), cv2.COLOR_BGR2RGB)
+
+            # Load style image
+            if isinstance(style_image, str):
+                style_pil = Image.open(style_image).convert("RGB")
+            else:
+                style_pil = style_image
+
+            height = pipe_kwargs.get("height", 1024)
+            width = pipe_kwargs.get("width", 1024)
+            dtype = self.unet.dtype if hasattr(self.unet, 'dtype') else torch.float16
+
+            # v5: Extract depth from STYLE image for ControlNet (preserves style's structure)
+            depth_image = None
+            controlnet_scale = 0.7  # Higher scale to preserve style structure
+            if self.controlnet is not None:
+                print(f">>> [ControlNet] Extracting depth from STYLE image...")
+                depth_image = self.get_depth_map(style_pil, target_size=(width, height))
+                if depth_image is not None:
+                    print(f">>> [ControlNet] Depth map extracted: {depth_image.size}")
+                else:
+                    print(f">>> [ControlNet] Depth extraction failed, proceeding without ControlNet")
+
+            # v5: Encode style image to latents for img2img
+            init_latents = None
+            if denoising_strength < 1.0:
+                print(f">>> [img2img] Encoding style image to latents...")
+                init_latents = self._prepare_style_latents(style_pil, height, width, generator, dtype)
+                print(f">>> [img2img] Style latents ready: {init_latents.shape}")
             faces = self.app.get(image)
 
             if len(faces) == 0:
@@ -304,11 +430,7 @@ class DecoupledGuidancePipelineXL(StableDiffusionXLPipeline):
                 face_crop_pil, torch.device(self.device), 1, output_hidden_states=True
             )
 
-            # 3. Extract Style CLIP embedding
-            if isinstance(style_image, str):
-                style_pil = Image.open(style_image).convert("RGB")
-            else:
-                style_pil = style_image
+            # 3. Extract Style CLIP embedding (style_pil already loaded above)
             style_resized = style_pil.resize((224, 224), Image.LANCZOS)
             style_clip_embeds, neg_style_clip_embeds = self.encode_image(
                 style_resized, torch.device(self.device), 1, output_hidden_states=True
@@ -353,8 +475,8 @@ class DecoupledGuidancePipelineXL(StableDiffusionXLPipeline):
 
             # 7. Use only FaceID adapter (Style adapter disabled if dual adapter loaded)
             if getattr(self, 'dual_adapter_enabled', False):
-                self.set_ip_adapter_scale([self._config.get("ip_adapter_scale", 0.5), 0.0])
-                print(f">>> [DEBUG] Dual adapter loaded but Style adapter disabled (scale=0)")
+                self.set_ip_adapter_scale([ip_adapter_scale, 0.0])
+                print(f">>> [DEBUG] FaceID scale={ip_adapter_scale}, Style adapter disabled (scale=0)")
 
                 # Create dummy style embedding with correct shape for Style adapter
                 # Style adapter (IP-Adapter Plus) expects [batch, 1, 257, 1280]
@@ -367,50 +489,112 @@ class DecoupledGuidancePipelineXL(StableDiffusionXLPipeline):
             else:
                 ip_adapter_embeds = [id_embeds]
 
-            res = self(
-                prompt=prompt,
-                negative_prompt=negative_prompt,
-                ip_adapter_image_embeds=ip_adapter_embeds,
-                num_images_per_prompt=1,
-                generator=generator,
-                callback=step_callback,
-                callback_steps=1,
+            # 8. Call pipeline with img2img + ControlNet + FaceID
+            call_kwargs = {
+                "prompt": prompt,
+                "negative_prompt": negative_prompt,
+                "ip_adapter_image_embeds": ip_adapter_embeds,
+                "num_images_per_prompt": 1,
+                "generator": generator,
+                "callback": step_callback,
+                "callback_steps": 1,
                 **pipe_kwargs
-            ).images[0]
+            }
+
+            # Add img2img params if init_latents available
+            if init_latents is not None:
+                call_kwargs["init_latents"] = init_latents
+                call_kwargs["denoising_strength"] = denoising_strength
+                print(f">>> [img2img] Using style latents with denoising={denoising_strength}")
+
+            # Add ControlNet params if depth image is available
+            if depth_image is not None and self.controlnet is not None:
+                call_kwargs["control_image"] = depth_image
+                call_kwargs["controlnet_conditioning_scale"] = controlnet_scale
+                print(f">>> [ControlNet] Using depth conditioning (scale={controlnet_scale})")
+
+            res = self(**call_kwargs).images[0]
 
         else:
-            # Original mode: single adapter or img2img style transfer
-            id_embeds, _ = get_faceid_embeds(
-                self,
-                self.app,
-                face_image,
-                "plus-v2",
-                do_cfg=True,
-                decoupled=True,
-                dcg_type=dcg_type
+            # Original mode: single adapter (no style image)
+            # When dual adapters are loaded, we need to provide embeddings for both
+            from PIL import Image
+            import cv2
+            import numpy as np
+            from insightface.utils import face_align
+
+            print(f">>> [FaceID Only Mode] No style image provided")
+
+            # Extract face embedding directly (same as CLIP blending mode)
+            if isinstance(face_image, str):
+                face_pil = Image.open(face_image)
+            else:
+                face_pil = face_image
+            image = cv2.cvtColor(np.asarray(face_pil), cv2.COLOR_BGR2RGB)
+
+            faces = self.app.get(image)
+            if len(faces) == 0:
+                raise ValueError("No face detected in the input image")
+
+            # Get InsightFace embedding
+            face_embedding = torch.from_numpy(faces[0].normed_embedding)
+            ref_images_embeds = face_embedding.unsqueeze(0).unsqueeze(0).unsqueeze(0)
+
+            # Build id_embeds with DCG batching
+            dtype = self.unet.dtype if hasattr(self.unet, 'dtype') else torch.float16
+            neg_ref_images_embeds = torch.zeros_like(ref_images_embeds)
+
+            if dcg_type == 4:
+                id_embeds = torch.cat([
+                    neg_ref_images_embeds,
+                    ref_images_embeds,
+                    ref_images_embeds,
+                    ref_images_embeds,
+                ], dim=0).to(dtype=dtype, device=self.device)
+            else:
+                id_embeds = torch.cat([
+                    neg_ref_images_embeds,
+                    ref_images_embeds,
+                    ref_images_embeds,
+                ], dim=0).to(dtype=dtype, device=self.device)
+
+            # Extract Face CLIP embedding for FaceID adapter
+            face_crop = face_align.norm_crop(image, landmark=faces[0].kps, image_size=224)
+            face_crop_pil = Image.fromarray(cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB))
+            face_clip_embeds, neg_face_clip_embeds = self.encode_image(
+                face_crop_pil, torch.device(self.device), 1, output_hidden_states=True
             )
 
-            print(f">>> [DEBUG] face_image: {face_image}")
-            print(f">>> [DEBUG] id_embeds is None: {id_embeds is None}")
-            if id_embeds is not None:
-                print(f">>> [DEBUG] id_embeds shape: {id_embeds.shape}")
+            # Set face CLIP embedding to FaceID adapter
+            face_clip_4d = face_clip_embeds.unsqueeze(1)
+            neg_face_clip_4d = neg_face_clip_embeds.unsqueeze(1)
 
-            # Prepare style latents for img2img approach
-            init_latents = None
-            if style_image is not None:
-                height = pipe_kwargs.get("height", 1024)
-                width = pipe_kwargs.get("width", 1024)
-                # Use VAE's dtype for consistency (float32 on MPS, float16 on CUDA)
-                vae_dtype = self.vae.dtype if hasattr(self.vae, 'dtype') else torch.float16
-                init_latents = self._prepare_style_latents(
-                    style_image, height, width, generator, vae_dtype
+            if dcg_type == 4:
+                face_clip_batched = torch.cat([
+                    neg_face_clip_4d, face_clip_4d, face_clip_4d, face_clip_4d
+                ], dim=0)
+            else:
+                face_clip_batched = torch.cat([
+                    neg_face_clip_4d, face_clip_4d, face_clip_4d
+                ], dim=0)
+
+            self.unet.encoder_hid_proj.image_projection_layers[0].clip_embeds = face_clip_batched.to(dtype=dtype)
+            self.unet.encoder_hid_proj.image_projection_layers[0].shortcut = True
+
+            # Handle dual adapter case: provide dummy style embedding
+            if getattr(self, 'dual_adapter_enabled', False):
+                self.set_ip_adapter_scale([ip_adapter_scale, 0.0])
+                print(f">>> [DEBUG] FaceID scale={ip_adapter_scale}, Style adapter disabled (scale=0)")
+
+                # Create dummy style embedding for Style adapter
+                batch_size = 4 if dcg_type == 4 else 3
+                dummy_style_embeds = torch.zeros(
+                    batch_size, 1, 257, 1280,
+                    dtype=dtype, device=self.device
                 )
-                print(f">>> [DEBUG] style_latents shape: {init_latents.shape}, strength: {style_strength}")
-
-            # Invert style_strength to denoising_strength:
-            # High style_strength = preserve more style = lower denoising
-            # Low style_strength = change more = higher denoising
-            denoising = 1.0 - style_strength if init_latents is not None else 1.0
+                ip_adapter_embeds = [id_embeds, dummy_style_embeds]
+            else:
+                ip_adapter_embeds = [id_embeds]
 
             # Create step callback for progress reporting
             total_steps = pipe_kwargs.get("num_inference_steps", 4)
@@ -421,11 +605,9 @@ class DecoupledGuidancePipelineXL(StableDiffusionXLPipeline):
             res = self(
                 prompt=prompt,
                 negative_prompt=negative_prompt,
-                ip_adapter_image_embeds=[id_embeds],
+                ip_adapter_image_embeds=ip_adapter_embeds,
                 num_images_per_prompt=1,
                 generator=generator,
-                init_latents=init_latents,
-                denoising_strength=denoising,
                 callback=step_callback,
                 callback_steps=1,
                 **pipe_kwargs
@@ -656,6 +838,9 @@ class DecoupledGuidancePipelineXL(StableDiffusionXLPipeline):
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         init_latents: Optional[torch.Tensor] = None,
         denoising_strength: float = 1.0,
+        # ControlNet parameters (v5)
+        control_image = None,
+        controlnet_conditioning_scale: float = 0.5,
         **kwargs,
     ):
         callback = kwargs.pop("callback", None)
@@ -837,6 +1022,21 @@ class DecoupledGuidancePipelineXL(StableDiffusionXLPipeline):
                 dcg_type=dcg_type
             )
 
+        # 7.5 Prepare ControlNet image (v5)
+        controlnet_image = None
+        if control_image is not None and self.controlnet is not None:
+            controlnet_image = self.prepare_controlnet_image(
+                control_image,
+                width,
+                height,
+                batch_size,
+                num_images_per_prompt,
+                device,
+                prompt_embeds.dtype,
+                dcg_type
+            )
+            print(f">>> [ControlNet] Prepared control image: {controlnet_image.shape}")
+
         # 8. Denoising loop
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
 
@@ -888,6 +1088,21 @@ class DecoupledGuidancePipelineXL(StableDiffusionXLPipeline):
                 added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
                 if ip_adapter_image is not None or ip_adapter_image_embeds is not None:
                     added_cond_kwargs["image_embeds"] = image_embeds
+
+                # ControlNet conditioning (v5)
+                down_block_res_samples = None
+                mid_block_res_sample = None
+                if controlnet_image is not None and self.controlnet is not None:
+                    down_block_res_samples, mid_block_res_sample = self.controlnet(
+                        latent_model_input,
+                        t,
+                        encoder_hidden_states=prompt_embeds,
+                        controlnet_cond=controlnet_image,
+                        conditioning_scale=controlnet_conditioning_scale,
+                        added_cond_kwargs=added_cond_kwargs,
+                        return_dict=False,
+                    )
+
                 noise_pred = self.unet(
                     latent_model_input,
                     t,
@@ -895,6 +1110,8 @@ class DecoupledGuidancePipelineXL(StableDiffusionXLPipeline):
                     timestep_cond=timestep_cond,
                     cross_attention_kwargs=self.cross_attention_kwargs,
                     added_cond_kwargs=added_cond_kwargs,
+                    down_block_additional_residuals=down_block_res_samples,
+                    mid_block_additional_residual=mid_block_res_sample,
                     return_dict=False,
                 )[0]
 
@@ -1175,18 +1392,41 @@ def prepare_dcg_pipeline(config, device, *args, **kwargs):
     return pipe
 
 
-def get_faceid_pipeline(config, device, dual_adapter=True):
-    """Load FaceID pipeline with optional dual IP-Adapter support.
+def get_faceid_pipeline(config, device, dual_adapter=True, load_controlnet=True):
+    """Load FaceID pipeline with optional dual IP-Adapter and ControlNet support.
 
     Args:
         config: Pipeline configuration
         device: Torch device
         dual_adapter: If True, load both FaceID and Style IP-Adapters
+        load_controlnet: If True, load ControlNet for depth conditioning (v5)
     """
     os.makedirs("models_cache", exist_ok=True)
 
     pipe = prepare_dcg_pipeline(config, device)
     ip_adapter_scale = config.get("ip_adapter_scale", 0.5)
+
+    # Load ControlNet for depth conditioning (v5)
+    if load_controlnet:
+        try:
+            print(">>> Loading ControlNet depth model...")
+            # Use float16 on CUDA and MPS (Mac), float32 only on CPU
+            use_fp16 = torch.cuda.is_available() or (hasattr(torch.backends, 'mps') and torch.backends.mps.is_available())
+            dtype = torch.float16 if use_fp16 else torch.float32
+            controlnet = ControlNetModel.from_pretrained(
+                "diffusers/controlnet-depth-sdxl-1.0",
+                torch_dtype=dtype,
+                variant="fp16" if dtype == torch.float16 else None,
+                cache_dir="models_cache/controlnet"
+            ).to(device)
+            pipe.controlnet = controlnet
+            print(">>> ControlNet depth model loaded successfully")
+        except Exception as e:
+            print(f">>> Warning: Failed to load ControlNet: {e}")
+            print(">>> Proceeding without ControlNet support")
+            pipe.controlnet = None
+    else:
+        pipe.controlnet = None
 
     image_encoder = CLIPVisionModelWithProjection.from_pretrained(
         "laion/CLIP-ViT-H-14-laion2B-s32B-b79K",

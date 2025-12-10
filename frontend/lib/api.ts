@@ -26,6 +26,7 @@ export interface GenerateParams {
   seed: number
   style_image_id?: string | null
   style_strength?: number
+  denoising_strength?: number
   inference_steps?: number
   dual_adapter_mode?: boolean
   title?: string
@@ -69,6 +70,7 @@ export interface HistorySettings {
   lora_scale: number
   seed: number
   style_strength?: number
+  denoising_strength?: number
   inference_steps?: number
   dual_adapter_mode?: boolean
   use_tiny_vae?: boolean
@@ -135,6 +137,9 @@ export async function generateImage(params: GenerateParams): Promise<GenerateRes
   }
   if (params.style_strength !== undefined) {
     formData.append('style_strength', params.style_strength.toString())
+  }
+  if (params.denoising_strength !== undefined) {
+    formData.append('denoising_strength', params.denoising_strength.toString())
   }
   if (params.inference_steps !== undefined) {
     formData.append('inference_steps', params.inference_steps.toString())

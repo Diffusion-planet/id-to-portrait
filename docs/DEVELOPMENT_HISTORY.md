@@ -12,7 +12,8 @@ FastFace 논문 구현체의 버전별 개발 히스토리와 기술적 변경�
 | v1 | f40ba93 | 2025-12-05 | Mac MPS 지원, Web UI, Style Image Transfer |
 | v2 | (uncommitted) | 2025-12-08 | RealVisXL 모델, 비동기 Task 시스템, Dual Adapter Mode 개선, VLM 프롬프트 생성 |
 | v3 | e9eef5e | 2025-12-08 | Batch-Wise Decoupled Embedding, img2img 제거, Face ID 보존 강화 |
-| v4 | (current) | 2025-12-11 | CLIP Blending으로 Identity Loss 문제 해결 |
+| v4 | 9e792cd | 2025-12-11 | CLIP Blending으로 Identity Loss 문제 해결 |
+| v5 | (current) | 2025-12-11 | ControlNet 통합 (Depth 기반 구조 보존) |
 
 ---
 
@@ -1049,6 +1050,199 @@ else:
 
 - ControlNet 통합으로 구조적 제약 추가
 - 인물 구조를 강제하면서 스타일만 변경 가능
+
+---
+
+## v5: ControlNet Integration (Structure Preservation)
+
+### Status: In Development (2025-12-11)
+
+v4의 CLIP Blending 방식 외에 **ControlNet**을 활용한 구조 보존 방식을 추가했습니다. 이 방식은 얼굴 이미지에서 추출한 **Depth Map**을 사용하여 생성 과정에서 구조적 제약을 강제합니다.
+
+### 1. 문제 분석 (v4 한계)
+
+v4의 CLIP Blending은 Identity Loss를 크게 개선했지만, 여전히 몇 가지 한계가 있습니다:
+
+1. **CLIP embedding의 근본적 한계**
+   - CLIP은 semantic 정보를 인코딩하므로 완벽한 스타일/구조 분리 불가
+   - 블렌딩 비율이 높아지면 스타일 효과가 약해짐
+
+2. **스타일 전송 vs 구조 보존 trade-off**
+   - 스타일을 강하게 적용하면 여전히 구조 왜곡 가능성 존재
+
+### 2. 해결책: ControlNet Depth Conditioning
+
+**ControlNet**은 생성 과정에서 **구조적 제약**을 강제하는 방법입니다.
+
+#### 핵심 아이디어
+
+```
+Face Image
+    |
+    v
+MiDaS Depth Estimator
+    |
+    v
+Depth Map (구조 정보)
+    |
+    v
+ControlNet Depth ──────────┐
+                           │
+Face Image                 │
+    |                      │
+    v                      │
+InsightFace + CLIP         │
+    |                      │
+    v                      │
+IP-Adapter FaceID ─────────┤
+                           │
+                           v
+                    UNet Cross-Attention
+                           |
+                           v
+                     Final Image
+```
+
+**원리:**
+- Depth Map은 "어디에 무엇이 있는지" (공간 구조) 정보를 담음
+- 얼굴 영역의 depth map이 있으면, 해당 위치에 얼굴이 생성됨
+- Style CLIP이 "인물 없음"을 인코딩해도 ControlNet이 구조를 강제
+
+### 3. 구현 구조
+
+#### 새로운 파일: `src/controlnet_pipeline.py`
+
+```python
+class ControlNetFaceIDPipeline:
+    """
+    ControlNet + IP-Adapter FaceID 통합 파이프라인
+
+    Workflow:
+    1. 얼굴 이미지에서 depth map 추출 (MiDaS)
+    2. 얼굴 embedding 추출 (InsightFace)
+    3. CLIP embedding 추출 (선택적 style 블렌딩)
+    4. ControlNet + IP-Adapter로 생성
+    """
+
+    def __init__(self, base_model_path, controlnet_path, device, dtype):
+        # ControlNet 로드
+        self.controlnet = ControlNetModel.from_pretrained(controlnet_path)
+
+        # Base pipeline with ControlNet
+        self.pipe = StableDiffusionXLControlNetPipeline.from_pretrained(
+            base_model_path,
+            controlnet=self.controlnet,
+        )
+
+        # InsightFace 초기화
+        self.app = FaceAnalysis(name="buffalo_l")
+
+    def get_depth_map(self, image, target_size=(1024, 1024)):
+        """MiDaS로 depth map 추출"""
+        depth_estimator = MidasDetector.from_pretrained("lllyasviel/Annotators")
+        return depth_estimator(image)
+
+    def generate(self, face_image, prompt, style_image=None, ...):
+        # 1. Depth map 추출
+        depth_map = self.get_depth_map(face_image)
+
+        # 2. Face embedding 추출
+        face_embedding, landmarks = self.get_face_embedding(face_image)
+
+        # 3. Face crop for IP-Adapter
+        face_crop = face_align.norm_crop(image, landmark=landmarks)
+
+        # 4. ControlNet + IP-Adapter 생성
+        result = self.pipe(
+            prompt=prompt,
+            image=depth_map,  # ControlNet input
+            ip_adapter_image=face_crop,
+            controlnet_conditioning_scale=0.5,
+            ...
+        )
+        return result.images[0]
+```
+
+### 4. 사용된 모델
+
+| 컴포넌트 | 모델 | 용도 |
+|---------|------|------|
+| ControlNet | `diffusers/controlnet-depth-sdxl-1.0` | Depth 기반 구조 제어 |
+| Depth Estimator | MiDaS (via controlnet-aux) | 이미지에서 depth map 추출 |
+| Base Model | RealVisXL V5.0 | SDXL 기반 실사 모델 |
+| IP-Adapter | FaceID Plus v2 | 얼굴 정체성 보존 |
+
+### 5. 주요 파라미터
+
+| 파라미터 | 기본값 | 설명 |
+|---------|--------|------|
+| `controlnet_conditioning_scale` | 0.5 | ControlNet 영향력 (0-1) |
+| `ip_adapter_scale` | 0.5 | FaceID 영향력 (0-1) |
+| `style_strength` | 0.3 | CLIP 블렌딩 비율 (선택적) |
+
+### 6. v4 vs v5 비교
+
+| 항목 | v4 (CLIP Blending) | v5 (ControlNet) |
+|------|-------------------|-----------------|
+| 구조 보존 방식 | CLIP embedding 블렌딩 | Depth map 기반 제약 |
+| 계산 비용 | 낮음 | 높음 (Depth + ControlNet) |
+| 구조 보존 강도 | 중간 (블렌딩 의존) | 강함 (명시적 제약) |
+| 스타일 분리 | 부분적 | 완전 분리 가능 |
+| 메모리 사용 | 기본 | +2GB (ControlNet) |
+
+### 7. 의존성 추가
+
+```bash
+# requirements.txt / requirements_mps.txt
+controlnet-aux>=0.0.7
+```
+
+### 8. 사용법
+
+```python
+from src.controlnet_pipeline import create_controlnet_pipeline
+
+# 파이프라인 생성
+pipe = create_controlnet_pipeline(
+    base_model="SG161222/RealVisXL_V5.0",
+    controlnet_model="diffusers/controlnet-depth-sdxl-1.0",
+    device="mps",  # or "cuda"
+    dtype=torch.float32,  # float16 for CUDA
+)
+
+# 생성
+result = pipe.generate(
+    face_image="face.jpg",
+    prompt="professional portrait, studio lighting",
+    style_image="style.jpg",  # 선택적
+    controlnet_conditioning_scale=0.5,
+    num_inference_steps=30,
+)
+```
+
+### 9. 한계점
+
+1. **높은 메모리 사용량**
+   - ControlNet 모델 추가 로드로 VRAM 2GB 추가 필요
+   - Mac M3 (18GB)에서는 문제 없음, 8GB GPU에서는 주의 필요
+
+2. **느린 생성 속도**
+   - Depth 추출 + ControlNet forward pass 추가
+   - 생성 시간 약 1.5배 증가
+
+3. **과도한 구조 제약**
+   - `controlnet_conditioning_scale`이 너무 높으면 창의적 생성 제한
+   - 0.3-0.5 범위 권장
+
+### 10. 권장 사용 시나리오
+
+| 시나리오 | 권장 방식 |
+|---------|----------|
+| 빠른 프로토타이핑 | v4 (CLIP Blending) |
+| 스타일 이미지에 인물 있음 | v4 (CLIP Blending) |
+| 스타일 이미지에 인물 없음 (배경/풍경) | v5 (ControlNet) |
+| 구조 보존이 중요한 경우 | v5 (ControlNet) |
+| 메모리 제약이 있는 환경 | v4 (CLIP Blending) |
 
 ---
 

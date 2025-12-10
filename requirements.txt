@@ -14,3 +14,6 @@ pillow==10.2.0
 facenet-pytorch==2.6.0
 image-reward==1.5
 clip @ git+https://github.com/openai/CLIP.git@dcba3cb2e2827b402d2701e7e1c7d9fed8a20ef1
+
+# ControlNet auxiliary (Option B - depth estimation)
+controlnet-aux>=0.0.7

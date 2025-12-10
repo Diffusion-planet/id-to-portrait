@@ -39,3 +39,6 @@ opencv-python
 
 # tqdm for progress bars
 tqdm
+
+# ControlNet auxiliary (Option B - depth estimation)
+controlnet-aux>=0.0.7

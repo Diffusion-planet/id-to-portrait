@@ -332,6 +332,7 @@ export default function Home() {
   const [loraScale, setLoraScale] = useState(0.6)
   const [seed, setSeed] = useState(42)
   const [styleStrength, setStyleStrength] = useState(0.3)
+  const [denoisingStrength, setDenoisingStrength] = useState(0.6)
   const [inferenceSteps, setInferenceSteps] = useState(4)
   const [dualAdapterMode, setDualAdapterMode] = useState(true)
   const [useTinyVae, setUseTinyVae] = useState(false) // Full VAE by default for better quality
@@ -541,6 +542,7 @@ export default function Home() {
         if (state.loraScale !== undefined) setLoraScale(state.loraScale)
         if (state.seed !== undefined) setSeed(state.seed)
         if (state.styleStrength !== undefined) setStyleStrength(state.styleStrength)
+        if (state.denoisingStrength !== undefined) setDenoisingStrength(state.denoisingStrength)
         if (state.inferenceSteps !== undefined) setInferenceSteps(state.inferenceSteps)
         if (state.dualAdapterMode !== undefined) setDualAdapterMode(state.dualAdapterMode)
         if (state.useTinyVae !== undefined) setUseTinyVae(state.useTinyVae)
@@ -562,6 +564,7 @@ export default function Home() {
       loraScale,
       seed,
       styleStrength,
+      denoisingStrength,
       inferenceSteps,
       dualAdapterMode,
       useTinyVae,
@@ -571,7 +574,7 @@ export default function Home() {
     } catch {
       // Ignore storage errors (quota exceeded, etc.)
     }
-  }, [isHydrated, selectedModel, prompt, negativePrompt, ips, loraScale, seed, styleStrength, inferenceSteps, dualAdapterMode, useTinyVae])
+  }, [isHydrated, selectedModel, prompt, negativePrompt, ips, loraScale, seed, styleStrength, denoisingStrength, inferenceSteps, dualAdapterMode, useTinyVae])
 
   // Handle file upload for face reference
   const handleFileSelect = useCallback(async (file: File) => {
@@ -682,6 +685,7 @@ export default function Home() {
         seed,
         style_image_id: styleImage?.id || null,
         style_strength: styleImage ? styleStrength : undefined,
+        denoising_strength: styleImage ? denoisingStrength : undefined,
         inference_steps: inferenceSteps,
         dual_adapter_mode: styleImage ? dualAdapterMode : false,
         title: title.trim() || getDefaultTitle(),
@@ -818,6 +822,7 @@ export default function Home() {
     setLoraScale(item.settings.lora_scale)
     setSeed(item.settings.seed)
     setStyleStrength(item.settings.style_strength ?? 0.3)
+    setDenoisingStrength(item.settings.denoising_strength ?? 0.6)
     setInferenceSteps(item.settings.inference_steps ?? 4)
     setDualAdapterMode(item.settings.dual_adapter_mode ?? true)
     setUseTinyVae(item.settings.use_tiny_vae ?? false)
@@ -1416,6 +1421,16 @@ export default function Home() {
                     description={dualAdapterMode
                       ? '스타일 CLIP 임베딩의 영향력을 조절합니다'
                       : '스타일 이미지의 영향력을 조절합니다'}
+                  />
+
+                  <VisualSlider
+                    value={denoisingStrength}
+                    onChange={setDenoisingStrength}
+                    min={0.2}
+                    max={1}
+                    step={0.05}
+                    label="Denoising 강도"
+                    description="낮을수록 스타일 이미지를 더 보존, 높을수록 텍스트 영향이 커집니다"
                   />
                 </>
               )}
