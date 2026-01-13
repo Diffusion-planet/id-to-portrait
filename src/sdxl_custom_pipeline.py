@@ -21,6 +21,7 @@ from transformers import CLIPVisionModelWithProjection, CLIPImageProcessor
 
 from .utils import get_faceid_embeds
 from .dcg import decoupled_cfg_predict
+from .face_parsing import FaceParser
 
 
 def get_style_embeds(
@@ -65,6 +66,9 @@ class DecoupledGuidancePipelineXL(StableDiffusionXLPipeline):
     _controlnet = None
     _depth_estimator = None
 
+    # v6: Face parser module (lazy loaded, modular design)
+    _face_parser_module = None
+
     @property
     def controlnet(self):
         """Lazy load ControlNet model."""
@@ -89,6 +93,14 @@ class DecoupledGuidancePipelineXL(StableDiffusionXLPipeline):
                 print(">>> Warning: controlnet_aux not installed, depth estimation disabled")
                 return None
         return self._depth_estimator
+
+    @property
+    def face_parser(self) -> FaceParser:
+        """Lazy load FaceParser module for face+hair segmentation (v6)."""
+        if self._face_parser_module is None:
+            device = self.device if hasattr(self, 'device') else "cpu"
+            self._face_parser_module = FaceParser(device=device)
+        return self._face_parser_module
 
     def get_depth_map(self, image, target_size=(1024, 1024)):
         """Extract depth map from image using MiDaS.
@@ -323,6 +335,11 @@ class DecoupledGuidancePipelineXL(StableDiffusionXLPipeline):
         negative_prompt=None,
         progress_callback=None,
         ip_adapter_scale=0.8,
+        # v6: Face masking parameters
+        mask_style_face=True,
+        face_mask_method='gaussian_blur',
+        include_hair_in_mask=True,
+        face_mask_blur_radius=50,
     ):
         from PIL import Image
 
@@ -379,22 +396,78 @@ class DecoupledGuidancePipelineXL(StableDiffusionXLPipeline):
             width = pipe_kwargs.get("width", 1024)
             dtype = self.unet.dtype if hasattr(self.unet, 'dtype') else torch.float16
 
+            # ============================================================
+            # v6: Face Masking in Style Image
+            # ============================================================
+            # Problem: If style image has a face, its structure conflicts
+            # with FaceID trying to generate a different face.
+            #
+            # Solution: Detect face in style image and mask it before processing
+            # - Mask face region in style image (blur/fill)
+            # - Mask face region in depth map (neutral depth)
+            # - This allows FaceID to control face generation entirely
+            # ============================================================
+            style_face_mask = None
+            style_pil_for_depth = style_pil
+            style_pil_for_latents = style_pil
+
+            if mask_style_face:
+                # Check if style image has a face
+                try:
+                    style_cv = cv2.cvtColor(np.asarray(style_pil), cv2.COLOR_RGB2BGR)
+                    style_faces = self.app.get(style_cv)
+                    style_has_face = len(style_faces) > 0
+                except Exception as e:
+                    print(f">>> [v6] Face detection in style image failed: {e}")
+                    style_has_face = False
+
+                if style_has_face:
+                    print(f">>> [v6] Style image has face detected, extracting mask...")
+                    style_face_mask = self.face_parser.get_face_hair_mask(
+                        style_pil,
+                        target_size=(width, height),
+                        include_hair=include_hair_in_mask
+                    )
+
+                    if style_face_mask is not None:
+                        print(f">>> [v6] Applying face mask to style image (method={face_mask_method})")
+                        style_pil_masked = self.face_parser.apply_mask(
+                            style_pil,
+                            style_face_mask,
+                            method=face_mask_method,
+                            blur_radius=face_mask_blur_radius
+                        )
+                        # Use masked image for depth and latents
+                        style_pil_for_depth = style_pil_masked
+                        style_pil_for_latents = style_pil_masked
+                    else:
+                        print(f">>> [v6] Face parsing failed, using original style image")
+                else:
+                    print(f">>> [v6] No face detected in style image, skipping mask")
+            else:
+                print(f">>> [v6] Face masking disabled (mask_style_face=False)")
+
             # v5: Extract depth from STYLE image for ControlNet (preserves style's structure)
+            # v6: Use masked style image if face was detected
             depth_image = None
             controlnet_scale = 0.7  # Higher scale to preserve style structure
             if self.controlnet is not None:
                 print(f">>> [ControlNet] Extracting depth from STYLE image...")
-                depth_image = self.get_depth_map(style_pil, target_size=(width, height))
+                depth_image = self.get_depth_map(style_pil_for_depth, target_size=(width, height))
                 if depth_image is not None:
                     print(f">>> [ControlNet] Depth map extracted: {depth_image.size}")
+                    # v6: Additionally mask depth map if face was detected
+                    if style_face_mask is not None:
+                        depth_image = self.face_parser.apply_mask_to_depth(depth_image, style_face_mask)
                 else:
                     print(f">>> [ControlNet] Depth extraction failed, proceeding without ControlNet")
 
             # v5: Encode style image to latents for img2img
+            # v6: Use masked style image if face was detected
             init_latents = None
             if denoising_strength < 1.0:
                 print(f">>> [img2img] Encoding style image to latents...")
-                init_latents = self._prepare_style_latents(style_pil, height, width, generator, dtype)
+                init_latents = self._prepare_style_latents(style_pil_for_latents, height, width, generator, dtype)
                 print(f">>> [img2img] Style latents ready: {init_latents.shape}")
             faces = self.app.get(image)
 

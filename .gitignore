@@ -17,3 +17,6 @@ models_cache/
 **/__pycache__
 **/.vscode
 
+test_output/
+*.DS_Store
+.DS_Store
