@@ -494,6 +494,11 @@ def run_generation_task(task_id: str, params: Dict[str, Any]):
                 negative_prompt=params.get("negative_prompt"),
                 progress_callback=lambda step, total: log_progress(f"Generating... step {step}/{total}"),
                 ip_adapter_scale=params["ips"],
+                # v6: Face masking parameters
+                mask_style_face=params.get("mask_style_face", True),
+                face_mask_method=params.get("face_mask_method", "gaussian_blur"),
+                include_hair_in_mask=params.get("include_hair_in_mask", True),
+                face_mask_blur_radius=params.get("face_mask_blur_radius", 50),
             )
 
         # Save output
@@ -526,6 +531,11 @@ def run_generation_task(task_id: str, params: Dict[str, Any]):
                 "inference_steps": params["inference_steps"],
                 "dual_adapter_mode": params.get("dual_adapter_mode", False),
                 "use_tiny_vae": params.get("use_tiny_vae", False),
+                # v6: Face masking settings
+                "mask_style_face": params.get("mask_style_face", True),
+                "face_mask_method": params.get("face_mask_method", "gaussian_blur"),
+                "include_hair_in_mask": params.get("include_hair_in_mask", True),
+                "face_mask_blur_radius": params.get("face_mask_blur_radius", 50),
             }
         }
         history.insert(0, history_item)
@@ -565,6 +575,11 @@ async def generate_image(
     dual_adapter_mode: bool = Form(False),
     title: str = Form(""),
     use_tiny_vae: bool = Form(False),
+    # v6: Face masking parameters
+    mask_style_face: bool = Form(True),
+    face_mask_method: str = Form("gaussian_blur"),
+    include_hair_in_mask: bool = Form(True),
+    face_mask_blur_radius: int = Form(50),
 ):
     global generation_tasks
 
@@ -606,6 +621,11 @@ async def generate_image(
             "dual_adapter_mode": dual_adapter_mode,
             "title": title,
             "use_tiny_vae": use_tiny_vae,
+            # v6: Face masking parameters
+            "mask_style_face": mask_style_face,
+            "face_mask_method": face_mask_method,
+            "include_hair_in_mask": include_hair_in_mask,
+            "face_mask_blur_radius": face_mask_blur_radius,
         },
         "image_url": None,
         "error": None,
