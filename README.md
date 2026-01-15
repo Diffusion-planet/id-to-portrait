@@ -265,12 +265,17 @@ id-to-portrait/
 
 ## 팀원
 
-| 이름 | GitHub |
-|------|--------|
-| 임병건 | [@byungkun0823](https://github.com/byungkun0823) |
-| 이성민 | [@danlee-dev](https://github.com/danlee-dev) |
-| 최서연 | [@seoyeon-eo](https://github.com/seoyeon-eo) |
-| 홍지연 | [@hongjiyeon56](https://github.com/hongjiyeon56) |
+| 임병건 (Byungkun Lim) | 이성민 (Seongmin Lee) |
+| :---: | :---: |
+| <img src="https://avatars.githubusercontent.com/byungkun0823" width="150px" alt="Byungkun Lim" /> | <img src="https://avatars.githubusercontent.com/danlee-dev" width="150px" alt="Seongmin Lee" /> |
+| [GitHub: @byungkun0823](https://github.com/byungkun0823) | [GitHub: @danlee-dev](https://github.com/danlee-dev) |
+| 고려대학교 컴퓨터학과 | 고려대학교 컴퓨터학과 |
+
+| 최서연 (Seoyeon Choi) | 홍지연 (Jiyeon Hong) |
+| :---: | :---: |
+| <img src="https://avatars.githubusercontent.com/seoyeon-eo" width="150px" alt="Seoyeon Choi" /> | <img src="https://avatars.githubusercontent.com/hongjiyeon56" width="150px" alt="Jiyeon Hong" /> |
+| [GitHub: @seoyeon-eo](https://github.com/seoyeon-eo) | [GitHub: @hongjiyeon56](https://github.com/hongjiyeon56) |
+| 고려대학교 컴퓨터학과 | 고려대학교 컴퓨터학과 |
 
 ---
 
