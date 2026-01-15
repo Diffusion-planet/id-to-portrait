@@ -42,3 +42,6 @@ tqdm
 
 # ControlNet auxiliary (Option B - depth estimation)
 controlnet-aux>=0.0.7
+
+# PDF report generation
+reportlab>=4.0.0

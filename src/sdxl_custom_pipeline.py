@@ -21,7 +21,7 @@ from transformers import CLIPVisionModelWithProjection, CLIPImageProcessor
 
 from .utils import get_faceid_embeds
 from .dcg import decoupled_cfg_predict
-from .face_parsing import FaceParser
+from .face_parsing import FaceParser, extract_hair_region
 
 
 def get_style_embeds(
@@ -127,6 +127,53 @@ class DecoupledGuidancePipelineXL(StableDiffusionXLPipeline):
         depth_map = self.depth_estimator(image_resized)
 
         return depth_map
+
+    def apply_mask_to_depth(self, depth_image, face_mask, mask_edge_blur=40, depth_blur_radius=80):
+        """Apply face mask to depth map to remove face shape constraint.
+
+        Blurs the face region in the depth map so ControlNet doesn't enforce
+        the original face's shape while preserving background/body structure.
+
+        Args:
+            depth_image: PIL Image (depth map)
+            face_mask: PIL Image (face mask, white=face region)
+            mask_edge_blur: Gaussian blur radius for mask edge softening
+            depth_blur_radius: Gaussian blur radius for depth map blurring
+
+        Returns:
+            Modified depth map as PIL Image
+        """
+        from PIL import Image, ImageFilter
+        import numpy as np
+
+        # Ensure same size
+        if face_mask.size != depth_image.size:
+            face_mask = face_mask.resize(depth_image.size, Image.LANCZOS)
+
+        # Convert to numpy
+        depth_array = np.array(depth_image).astype(np.float32)
+        mask_array = np.array(face_mask.convert('L')).astype(np.float32) / 255.0
+
+        # Expand mask slightly and blur edges for smooth transition
+        # v7: Use frontend-controlled mask_edge_blur parameter
+        mask_pil = Image.fromarray((mask_array * 255).astype(np.uint8))
+        if mask_edge_blur > 0:
+            mask_pil = mask_pil.filter(ImageFilter.GaussianBlur(radius=mask_edge_blur))
+        mask_array = np.array(mask_pil).astype(np.float32) / 255.0
+
+        # Create heavily blurred version of depth map
+        # v7: Use frontend-controlled depth_blur_radius parameter
+        blurred_depth = depth_image.filter(ImageFilter.GaussianBlur(radius=depth_blur_radius))
+        blurred_array = np.array(blurred_depth).astype(np.float32)
+
+        # Blend: original depth outside face, blurred depth inside face
+        if len(depth_array.shape) == 3:
+            mask_array = mask_array[:, :, np.newaxis]
+
+        result_array = depth_array * (1 - mask_array) + blurred_array * mask_array
+        result_array = np.clip(result_array, 0, 255).astype(np.uint8)
+
+        return Image.fromarray(result_array)
 
     def prepare_controlnet_image(self, image, width, height, batch_size, num_images_per_prompt, device, dtype, dcg_type=3):
         """Prepare depth image for ControlNet conditioning.
@@ -340,6 +387,23 @@ class DecoupledGuidancePipelineXL(StableDiffusionXLPipeline):
         face_mask_method='gaussian_blur',
         include_hair_in_mask=True,
         face_mask_blur_radius=50,
+        # v7: Advanced Face masking parameters (frontend control)
+        mask_expand_pixels=10,
+        mask_edge_blur=10,
+        controlnet_scale=0.4,
+        depth_blur_radius=80,
+        style_strength_cap=0.10,
+        denoising_min=0.90,
+        # v7.2: Hair coverage ratio
+        bbox_expand_ratio=1.5,
+        # v7.3: Hair preservation from face reference
+        hair_strength=0.5,
+        # v7.4: Aspect ratio adjustment toggle
+        adjust_mask_aspect_ratio=False,
+        # v7.6: Face size matching - constrain generated face to style face size
+        match_style_face_size=True,
+        # v7: Output directory for saving masked style image
+        output_dir=None,
     ):
         from PIL import Image
 
@@ -386,6 +450,20 @@ class DecoupledGuidancePipelineXL(StableDiffusionXLPipeline):
                 face_pil = face_image
             image = cv2.cvtColor(np.asarray(face_pil), cv2.COLOR_BGR2RGB)
 
+            # v7: Detect input face early for aspect ratio and size calculation
+            input_faces = self.app.get(image)
+            input_face_aspect_ratio = None
+            input_face_area = None  # v7.6: For face size matching
+            if len(input_faces) > 0:
+                input_bbox = input_faces[0].bbox  # [x1, y1, x2, y2]
+                input_face_width = input_bbox[2] - input_bbox[0]
+                input_face_height = input_bbox[3] - input_bbox[1]
+                if input_face_width > 0:
+                    input_face_aspect_ratio = input_face_height / input_face_width
+                    input_face_area = input_face_width * input_face_height  # v7.6
+                    print(f">>> [v7] Input face aspect ratio: {input_face_aspect_ratio:.2f} (w={input_face_width:.0f}, h={input_face_height:.0f})")
+                    print(f">>> [v7.6] Input face area: {input_face_area:.0f}px")
+
             # Load style image
             if isinstance(style_image, str):
                 style_pil = Image.open(style_image).convert("RGB")
@@ -423,11 +501,63 @@ class DecoupledGuidancePipelineXL(StableDiffusionXLPipeline):
 
                 if style_has_face:
                     print(f">>> [v6] Style image has face detected, extracting mask...")
+                    # v7.1: Get face bbox from InsightFace to filter SegFormer noise
+                    style_face_bbox = None
+                    effective_bbox_expand_ratio = bbox_expand_ratio  # v7.6: May be adjusted for size matching
+                    if len(style_faces) > 0:
+                        bbox = style_faces[0].bbox  # [x1, y1, x2, y2]
+                        style_face_bbox = (int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]))
+                        print(f">>> [v7.1] Style face bbox: {style_face_bbox}")
+
+                        # v7.6: Face size matching - adjust bbox_expand_ratio based on face size comparison
+                        if match_style_face_size and input_face_area is not None:
+                            style_face_width = bbox[2] - bbox[0]
+                            style_face_height = bbox[3] - bbox[1]
+                            style_face_area = style_face_width * style_face_height
+
+                            # Calculate size ratio (normalized to image dimensions)
+                            input_img_area = face_pil.size[0] * face_pil.size[1]
+                            style_img_area = style_pil.size[0] * style_pil.size[1]
+
+                            # Normalize face areas by their respective image sizes
+                            input_face_ratio = input_face_area / input_img_area
+                            style_face_ratio = style_face_area / style_img_area
+
+                            size_ratio = style_face_ratio / input_face_ratio if input_face_ratio > 0 else 1.0
+
+                            print(f">>> [v7.6] Style face area: {style_face_area:.0f}px ({style_face_ratio*100:.1f}% of image)")
+                            print(f">>> [v7.6] Input face ratio: {input_face_ratio*100:.1f}%, Style face ratio: {style_face_ratio*100:.1f}%")
+                            print(f">>> [v7.6] Size ratio (style/input): {size_ratio:.2f}")
+
+                            # If input face is larger (ratio < 1), reduce expansion to keep generated face smaller
+                            if size_ratio < 1.0:
+                                # Reduce expansion proportionally: smaller style face = less expansion
+                                # Clamp to minimum of 1.0 (no expansion)
+                                effective_bbox_expand_ratio = max(1.0, bbox_expand_ratio * size_ratio)
+                                print(f">>> [v7.6] Adjusted bbox_expand_ratio: {bbox_expand_ratio:.2f} -> {effective_bbox_expand_ratio:.2f}")
+                            else:
+                                print(f">>> [v7.6] Style face is larger/equal, keeping bbox_expand_ratio={bbox_expand_ratio:.2f}")
+
+                    # v7: Use frontend-controlled mask_expand_pixels and mask_edge_blur
                     style_face_mask = self.face_parser.get_face_hair_mask(
                         style_pil,
                         target_size=(width, height),
-                        include_hair=include_hair_in_mask
+                        include_hair=include_hair_in_mask,
+                        expand_pixels=mask_expand_pixels,
+                        blur_radius=mask_edge_blur,
+                        face_bbox=style_face_bbox,  # v7.1: Pass bbox to filter noise
+                        bbox_expand_ratio=effective_bbox_expand_ratio  # v7.6: Size-adjusted
                     )
+
+                    # v7.4: Only adjust mask aspect ratio if toggle is enabled
+                    if adjust_mask_aspect_ratio and style_face_mask is not None and input_face_aspect_ratio is not None:
+                        style_face_mask = self.face_parser.adjust_mask_for_aspect_ratio(
+                            style_face_mask,
+                            target_aspect_ratio=input_face_aspect_ratio
+                        )
+                        print(f">>> [Pipeline] Mask adjusted for aspect ratio")
+                    elif input_face_aspect_ratio is not None:
+                        print(f">>> [Pipeline] Aspect ratio adjustment disabled (toggle off)")
 
                     if style_face_mask is not None:
                         print(f">>> [v6] Applying face mask to style image (method={face_mask_method})")
@@ -440,36 +570,70 @@ class DecoupledGuidancePipelineXL(StableDiffusionXLPipeline):
                         # Use masked image for depth and latents
                         style_pil_for_depth = style_pil_masked
                         style_pil_for_latents = style_pil_masked
+
+                        # v7: Save masked style image for preview
+                        if output_dir is not None:
+                            import uuid
+                            masked_style_id = str(uuid.uuid4())
+                            masked_style_filename = f"masked_style_{masked_style_id}.png"
+                            masked_style_path = f"{output_dir}/{masked_style_filename}"
+                            style_pil_masked.save(masked_style_path)
+                            self._masked_style_path = masked_style_path
+                            print(f">>> [v7] Saved masked style image: {masked_style_path}")
+                        else:
+                            self._masked_style_path = None
                     else:
                         print(f">>> [v6] Face parsing failed, using original style image")
+                        self._masked_style_path = None
                 else:
                     print(f">>> [v6] No face detected in style image, skipping mask")
+                    self._masked_style_path = None
             else:
                 print(f">>> [v6] Face masking disabled (mask_style_face=False)")
+                self._masked_style_path = None
 
             # v5: Extract depth from STYLE image for ControlNet (preserves style's structure)
-            # v6: Use masked style image if face was detected
+            # v6: Mask face region in depth map when face masking is active
+            # This preserves background/body structure but removes face shape constraint
             depth_image = None
-            controlnet_scale = 0.7  # Higher scale to preserve style structure
+            # v7: Use frontend-controlled controlnet_scale parameter (no hardcoded default)
+
             if self.controlnet is not None:
                 print(f">>> [ControlNet] Extracting depth from STYLE image...")
-                depth_image = self.get_depth_map(style_pil_for_depth, target_size=(width, height))
+                depth_image = self.get_depth_map(style_pil, target_size=(width, height))
+
                 if depth_image is not None:
                     print(f">>> [ControlNet] Depth map extracted: {depth_image.size}")
-                    # v6: Additionally mask depth map if face was detected
+
+                    # v7: Apply face mask to depth with frontend-controlled parameters
                     if style_face_mask is not None:
-                        depth_image = self.face_parser.apply_mask_to_depth(depth_image, style_face_mask)
+                        print(f">>> [ControlNet] Applying face mask to depth map...")
+                        depth_image = self.apply_mask_to_depth(
+                            depth_image,
+                            style_face_mask,
+                            mask_edge_blur=mask_edge_blur,
+                            depth_blur_radius=depth_blur_radius
+                        )
+                        print(f">>> [v7] ControlNet face masking active - scale={controlnet_scale}, depth_blur={depth_blur_radius}")
                 else:
                     print(f">>> [ControlNet] Depth extraction failed, proceeding without ControlNet")
 
-            # v5: Encode style image to latents for img2img
-            # v6: Use masked style image if face was detected
+            # v7: Use frontend-controlled denoising parameters (no auto-override)
             init_latents = None
-            if denoising_strength < 1.0:
+            if style_face_mask is not None:
+                # Use frontend-controlled denoising_min when face masking is active
+                effective_denoising = denoising_min
+                print(f">>> [v7] Face masking active - using denoising_min={effective_denoising}")
+            else:
+                effective_denoising = denoising_strength
+
+            if effective_denoising < 1.0:
                 print(f">>> [img2img] Encoding style image to latents...")
                 init_latents = self._prepare_style_latents(style_pil_for_latents, height, width, generator, dtype)
                 print(f">>> [img2img] Style latents ready: {init_latents.shape}")
-            faces = self.app.get(image)
+
+            # Reuse already detected input faces (v7: detected earlier for aspect ratio)
+            faces = input_faces
 
             if len(faces) == 0:
                 raise ValueError("No face detected in the input image")
@@ -503,22 +667,63 @@ class DecoupledGuidancePipelineXL(StableDiffusionXLPipeline):
                 face_crop_pil, torch.device(self.device), 1, output_hidden_states=True
             )
 
-            # 3. Extract Style CLIP embedding (style_pil already loaded above)
-            style_resized = style_pil.resize((224, 224), Image.LANCZOS)
+            # 2.5 v7.3: Extract Hair CLIP embedding from face reference
+            hair_clip_embeds = None
+            neg_hair_clip_embeds = None
+            effective_hair_strength = hair_strength
+
+            if hair_strength > 0:
+                print(f">>> [v7.3] Extracting hair region from face reference (strength={hair_strength})")
+                hair_region_image = extract_hair_region(face_pil, self.face_parser)
+
+                if hair_region_image is not None:
+                    # Resize hair region to CLIP input size
+                    hair_resized = hair_region_image.resize((224, 224), Image.LANCZOS)
+                    hair_clip_embeds, neg_hair_clip_embeds = self.encode_image(
+                        hair_resized, torch.device(self.device), 1, output_hidden_states=True
+                    )
+                    print(f">>> [v7.3] Hair CLIP embedding extracted: {hair_clip_embeds.shape}")
+                else:
+                    print(f">>> [v7.3] Hair extraction failed, using face_clip only")
+                    effective_hair_strength = 0
+
+            # 3. CLIP Embedding: v7 - Use frontend-controlled style_strength_cap (no auto-override)
+            if style_face_mask is not None:
+                # Use frontend-controlled style_strength_cap when face masking is active
+                effective_style_strength = style_strength_cap
+                print(f">>> [v7] Face masking active - using style_strength_cap={effective_style_strength}")
+            else:
+                effective_style_strength = style_strength
+
+            style_for_clip = style_pil_for_latents if style_face_mask is not None else style_pil
+            style_resized = style_for_clip.resize((224, 224), Image.LANCZOS)
             style_clip_embeds, neg_style_clip_embeds = self.encode_image(
                 style_resized, torch.device(self.device), 1, output_hidden_states=True
             )
 
-            # 4. Blend face and style CLIP embeddings
-            # Higher style_strength = more style influence, but face_clip's
-            # "person existence" information is always partially preserved
-            blended_pos = (1 - style_strength) * face_clip_embeds + style_strength * style_clip_embeds
-            blended_neg = (1 - style_strength) * neg_face_clip_embeds + style_strength * neg_style_clip_embeds
+            # v7.3: Three-way CLIP blending: Face + Hair + Style
+            # Step 1: Blend face and hair (within face reference)
+            if hair_clip_embeds is not None and effective_hair_strength > 0:
+                face_hair_blend_pos = (1 - effective_hair_strength) * face_clip_embeds + effective_hair_strength * hair_clip_embeds
+                face_hair_blend_neg = (1 - effective_hair_strength) * neg_face_clip_embeds + effective_hair_strength * neg_hair_clip_embeds
+                print(f">>> [v7.3] Face+Hair blend: Face={1-effective_hair_strength:.1%}, Hair={effective_hair_strength:.1%}")
+            else:
+                face_hair_blend_pos = face_clip_embeds
+                face_hair_blend_neg = neg_face_clip_embeds
 
+            # Step 2: Blend (Face+Hair) with Style
+            blended_pos = (1 - effective_style_strength) * face_hair_blend_pos + effective_style_strength * style_clip_embeds
+            blended_neg = (1 - effective_style_strength) * face_hair_blend_neg + effective_style_strength * neg_style_clip_embeds
+
+            if style_face_mask is not None:
+                print(f">>> [CLIP] Using MASKED style image with reduced strength")
             print(f">>> [DEBUG] face_clip_embeds shape: {face_clip_embeds.shape}")
             print(f">>> [DEBUG] style_clip_embeds shape: {style_clip_embeds.shape}")
+            if hair_clip_embeds is not None:
+                print(f">>> [DEBUG] hair_clip_embeds shape: {hair_clip_embeds.shape}")
+            print(f">>> [DEBUG] Final blend - FaceRef: {1-effective_style_strength:.1%}, Style: {effective_style_strength:.1%}")
+
             print(f">>> [DEBUG] blended_pos shape: {blended_pos.shape}")
-            print(f">>> [DEBUG] Blend ratio - Face: {1-style_strength:.1%}, Style: {style_strength:.1%}")
 
             # 5. Build batched CLIP embedding for DCG
             # ImageProjection expects 4D: [batch, num_images, seq_len, hidden_dim]
@@ -577,8 +782,8 @@ class DecoupledGuidancePipelineXL(StableDiffusionXLPipeline):
             # Add img2img params if init_latents available
             if init_latents is not None:
                 call_kwargs["init_latents"] = init_latents
-                call_kwargs["denoising_strength"] = denoising_strength
-                print(f">>> [img2img] Using style latents with denoising={denoising_strength}")
+                call_kwargs["denoising_strength"] = effective_denoising
+                print(f">>> [img2img] Using style latents with denoising={effective_denoising}")
 
             # Add ControlNet params if depth image is available
             if depth_image is not None and self.controlnet is not None:
@@ -689,7 +894,11 @@ class DecoupledGuidancePipelineXL(StableDiffusionXLPipeline):
         if after_hook_fn is not None:
             after_hook_fn(self, res)
 
-        return res
+        # v7: Return dict with both image and masked style path
+        return {
+            "image": res,
+            "masked_style_path": getattr(self, '_masked_style_path', None)
+        }
 
     def _encode_style_for_adapter(self, style_image, dcg_type=3):
         """Encode style image for the Style IP-Adapter (second adapter).
